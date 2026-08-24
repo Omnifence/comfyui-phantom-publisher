@@ -756,6 +756,33 @@ class ConfigPermissionTests(unittest.TestCase):
             self.assertFalse(config.is_symlink())
 
 
+class ServerWarningTests(unittest.TestCase):
+    """
+    Phantom attaches advisory `warnings` to a version response — e.g. "this
+    machine's ComfyUI core is newer than every base image the platform knows".
+    They must reach the publish log, and a malformed field must never fail a
+    publish that already carries real artifacts.
+    """
+
+    def test_logs_each_server_warning_as_a_warning_line(self):
+        job = {"status": "staging", "logs": []}
+        publisher._log_server_warnings(
+            job,
+            {"workflow_version_id": "v-1", "warnings": ["core 0.99.0 outruns every base image"]},
+        )
+        self.assertEqual(len(job["logs"]), 1)
+        self.assertEqual(job["logs"][0]["level"], "warning")
+        self.assertIn("outruns every base image", job["logs"][0]["message"])
+
+    def test_tolerates_older_servers_and_malformed_fields(self):
+        job = {"status": "staging", "logs": []}
+        publisher._log_server_warnings(job, {"workflow_version_id": "v-1"})
+        publisher._log_server_warnings(job, {"warnings": "not-a-list"})
+        publisher._log_server_warnings(job, {"warnings": [7, None, ""]})
+        publisher._log_server_warnings(job, None)
+        self.assertEqual(job["logs"], [])
+
+
 class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
     def test_publish_log_records_context_and_keeps_a_bounded_tail(self):
         job = {"status": "uploading", "logs": []}
