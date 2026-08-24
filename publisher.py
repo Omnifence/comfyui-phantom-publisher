@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.3.1"
+PUBLISHER_VERSION = "0.4.0"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -491,7 +491,49 @@ def _literal_huggingface_repositories(directory: Path) -> set[str]:
     return repositories
 
 
-def _huggingface_snapshot(repo_id: str) -> tuple[Path, str]:
+# A Hugging Face id is `org/name` whatever it names, so the scanner cannot tell
+# a model from a Space or a dataset. snapshot_download assumes "model", and the
+# hub answers a wrong type with a 401 rather than a 404 — it will not confirm
+# that a repository is absent — which failed a whole publish on one Space.
+_HUGGINGFACE_REPO_TYPES = ("model", "space", "dataset")
+
+# Only a model sits at the root of huggingface.co. The other two are namespaced.
+_HUGGINGFACE_URL_PREFIXES = {"model": "", "space": "spaces/", "dataset": "datasets/"}
+
+
+def _huggingface_repo_type(repo_id: str) -> str | None:
+    """
+    Resolve which kind of repository an id names, or None if it names none.
+
+    Probing costs one extra request for a model and two for a Space, which is
+    cheap next to the download it precedes.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        # Let _huggingface_snapshot raise the actionable "not installed" error
+        # rather than reporting this as an unresolvable repository.
+        return "model"
+    repo_exists = getattr(HfApi(), "repo_exists", None)
+    if not callable(repo_exists):
+        # huggingface_hub before 0.20 has no repo_exists. Assume a model, which
+        # is what this did before the probe existed.
+        return "model"
+    for repo_type in _HUGGINGFACE_REPO_TYPES:
+        try:
+            if repo_exists(repo_id, repo_type=repo_type):
+                return repo_type
+        except Exception:
+            continue
+    return None
+
+
+def _huggingface_url(repo_id: str, repo_type: str, revision: str) -> str:
+    prefix = _HUGGINGFACE_URL_PREFIXES.get(repo_type, "")
+    return f"https://huggingface.co/{prefix}{repo_id}/tree/{revision}"
+
+
+def _huggingface_snapshot(repo_id: str, repo_type: str = "model") -> tuple[Path, str]:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as error:
@@ -499,12 +541,14 @@ def _huggingface_snapshot(repo_id: str) -> tuple[Path, str]:
             f'Used node declares Hugging Face model "{repo_id}", but huggingface_hub is not installed'
         ) from error
     try:
-        snapshot = Path(snapshot_download(repo_id=repo_id)).resolve()
+        snapshot = Path(snapshot_download(repo_id=repo_id, repo_type=repo_type)).resolve()
     except Exception as error:
-        raise RuntimeError(f'Could not snapshot Hugging Face model "{repo_id}": {error}') from error
-    # snapshot_download returns .../models--org--repo/snapshots/<commit>. The
+        raise RuntimeError(f'Could not snapshot Hugging Face {repo_type} "{repo_id}": {error}') from error
+    # snapshot_download returns .../<type>s--org--repo/snapshots/<commit>. The
     # whole repository cache includes refs and content-addressed blobs needed by
-    # Transformers when the upstream repository is no longer reachable.
+    # Transformers when the upstream repository is no longer reachable, and the
+    # cache directory name carries the repo type, so restoring the archive is
+    # enough for an offline snapshot_download of any of the three types.
     if snapshot.parent.name != "snapshots" or not snapshot.parent.parent.is_dir():
         raise RuntimeError(f'Unexpected Hugging Face cache path for "{repo_id}": {snapshot}')
     return snapshot.parent.parent, snapshot.name
@@ -513,6 +557,7 @@ def _huggingface_snapshot(repo_id: str) -> tuple[Path, str]:
 def _discover_huggingface_models(
     packages: list[dict[str, Any]],
     on_repository: Callable[[str, int, int], None] | None = None,
+    on_skipped: Callable[[str, str], None] | None = None,
 ) -> list[dict[str, Any]]:
     discovered: list[dict[str, Any]] = []
     repo_ids: set[str] = set()
@@ -524,7 +569,15 @@ def _discover_huggingface_models(
         for index, repo_id in enumerate(sorted_repo_ids):
             if on_repository:
                 on_repository(repo_id, index, len(sorted_repo_ids))
-            cache_directory, revision = _huggingface_snapshot(repo_id)
+            repo_type = _huggingface_repo_type(repo_id)
+            if repo_type is None:
+                # `org/name` is also the shape of a local relative path, so the
+                # scanner produces false positives. One of those must not fail
+                # a publish that has already archived real dependencies.
+                if on_skipped:
+                    on_skipped(repo_id, "no model, Space or dataset repository has that id")
+                continue
+            cache_directory, revision = _huggingface_snapshot(repo_id, repo_type)
             archive, digest, size = _archive_package(cache_directory)
             discovered.append(
                 {
@@ -533,10 +586,11 @@ def _discover_huggingface_models(
                     "comfyui_path": ".cache/huggingface/hub",
                     "sha256": digest,
                     "byte_size": size,
-                    "source_urls": [f"https://huggingface.co/{repo_id}/tree/{revision}"],
+                    "source_urls": [_huggingface_url(repo_id, repo_type, revision)],
                     "archive_format": "tar.gz",
                     "install_path": "opt/phantom/huggingface/hub",
                     "external_repository": repo_id,
+                    "repo_type": repo_type,
                     "revision": revision,
                     "_local_path": str(archive),
                 }
@@ -864,6 +918,9 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
                 progress=20 + int(9 * (index / max(1, total))),
             )
 
+        def report_skipped_repository(repo_id: str, reason: str) -> None:
+            _job_log(job, f'Skipped external model "{repo_id}": {reason}.', level="warning")
+
         _job_step(
             job,
             "Checking custom nodes for external model repositories…",
@@ -871,7 +928,10 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
             progress=20,
         )
         models += await asyncio.to_thread(
-            _discover_huggingface_models, packages, report_external_repository
+            _discover_huggingface_models,
+            packages,
+            report_external_repository,
+            report_skipped_repository,
         )
         temporary_archives += [
             Path(item["_local_path"])

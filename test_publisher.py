@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -256,6 +257,128 @@ class PublisherDiscoveryTests(unittest.TestCase):
                     publisher.folder_paths.folder_names_and_paths = original_names
 
             self.assertEqual([model["filename"] for model in models], ["primary.safetensors"])
+
+
+class HuggingFaceRepositoryTypeTests(unittest.TestCase):
+    """
+    A Hugging Face id is `org/name` whether it names a model, a Space or a
+    dataset. snapshot_download assumes a model, and the hub answers a wrong
+    type with a 401 rather than a 404, so one Space id failed a whole publish.
+    """
+
+    def _install_hub(self, exists=None, api=None):
+        hub = types.ModuleType("huggingface_hub")
+        if api is None:
+            probed: list[tuple[str, str]] = []
+
+            class _Api:
+                def repo_exists(self, repo_id: str, repo_type: str | None = None) -> bool:
+                    probed.append((repo_id, repo_type or "model"))
+                    return exists(repo_id, repo_type or "model")
+
+            api = _Api
+            self.probed = probed
+        hub.HfApi = api
+        sys.modules["huggingface_hub"] = hub
+        self.addCleanup(sys.modules.pop, "huggingface_hub", None)
+
+    def test_resolves_a_space_id_that_is_not_a_model(self):
+        self._install_hub(exists=lambda _repo_id, repo_type: repo_type == "space")
+        self.assertEqual(
+            publisher._huggingface_repo_type("xxparthparekhxx/NudeNet-FastAPI"), "space"
+        )
+        # A model still costs a single probe; a Space costs two.
+        self.assertEqual(
+            self.probed,
+            [
+                ("xxparthparekhxx/NudeNet-FastAPI", "model"),
+                ("xxparthparekhxx/NudeNet-FastAPI", "space"),
+            ],
+        )
+
+    def test_reports_an_id_that_names_no_repository(self):
+        self._install_hub(exists=lambda _repo_id, _repo_type: False)
+        self.assertIsNone(publisher._huggingface_repo_type("some/local-path"))
+
+    def test_treats_a_probe_error_as_a_miss_and_keeps_probing(self):
+        def exists(_repo_id: str, repo_type: str) -> bool:
+            if repo_type == "model":
+                raise RuntimeError("gateway timeout")
+            return repo_type == "dataset"
+
+        self._install_hub(exists=exists)
+        self.assertEqual(publisher._huggingface_repo_type("org/corpus"), "dataset")
+
+    def test_assumes_a_model_when_huggingface_hub_predates_repo_exists(self):
+        class _OldApi:
+            pass
+
+        self._install_hub(api=_OldApi)
+        self.assertEqual(publisher._huggingface_repo_type("org/model"), "model")
+
+    def test_namespaces_the_recorded_url_by_repository_type(self):
+        self.assertEqual(
+            publisher._huggingface_url("org/model", "model", "abc"),
+            "https://huggingface.co/org/model/tree/abc",
+        )
+        self.assertEqual(
+            publisher._huggingface_url("org/space", "space", "abc"),
+            "https://huggingface.co/spaces/org/space/tree/abc",
+        )
+        self.assertEqual(
+            publisher._huggingface_url("org/corpus", "dataset", "abc"),
+            "https://huggingface.co/datasets/org/corpus/tree/abc",
+        )
+
+
+class HuggingFaceDiscoveryTests(unittest.TestCase):
+    def _discover(self, repo_types: dict[str, str | None]):
+        skipped: list[tuple[str, str]] = []
+        original_type = publisher._huggingface_repo_type
+        original_snapshot = publisher._huggingface_snapshot
+        original_repositories = publisher._literal_huggingface_repositories
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        (Path(cache.name) / "config.json").write_text("{}", encoding="utf-8")
+        publisher._huggingface_repo_type = lambda repo_id: repo_types[repo_id]
+        publisher._huggingface_snapshot = lambda repo_id, repo_type: (Path(cache.name), "abc123")
+        publisher._literal_huggingface_repositories = lambda _source: set(repo_types)
+        try:
+            models = publisher._discover_huggingface_models(
+                [{"_source_files": ["node.py"]}],
+                None,
+                lambda repo_id, reason: skipped.append((repo_id, reason)),
+            )
+        finally:
+            publisher._huggingface_repo_type = original_type
+            publisher._huggingface_snapshot = original_snapshot
+            publisher._literal_huggingface_repositories = original_repositories
+        for model in models:
+            self.addCleanup(
+                shutil.rmtree, str(Path(model["_local_path"]).parent), ignore_errors=True
+            )
+        return models, skipped
+
+    def test_archives_a_space_and_records_its_type_and_url(self):
+        models, skipped = self._discover({"xxparthparekhxx/NudeNet-FastAPI": "space"})
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["repo_type"], "space")
+        self.assertEqual(
+            models[0]["source_urls"],
+            ["https://huggingface.co/spaces/xxparthparekhxx/NudeNet-FastAPI/tree/abc123"],
+        )
+        self.assertEqual(models[0]["install_path"], "opt/phantom/huggingface/hub")
+
+    def test_skips_an_unresolvable_id_without_failing_the_publish(self):
+        # `org/name` is also the shape of a local relative path, so the source
+        # scan produces false positives. One must not fail a publish that has
+        # already archived real dependencies.
+        models, skipped = self._discover({"org/real-model": "model", "some/local-path": None})
+        self.assertEqual([model["external_repository"] for model in models], ["org/real-model"])
+        self.assertEqual(
+            skipped, [("some/local-path", "no model, Space or dataset repository has that id")]
+        )
 
 
 class PipDependencyCaptureTests(unittest.TestCase):
