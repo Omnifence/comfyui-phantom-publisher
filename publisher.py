@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.3.0"
+PUBLISHER_VERSION = "0.3.1"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -160,7 +160,33 @@ def _node_properties(ui_workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+# Discovery probes every string input of every node against every model
+# directory, so it also sees prompts, seeds and free text. A prompt is not a
+# filename, and the filesystem does not answer "no" politely: joining an
+# over-long string to a model root and calling is_file() raises
+# OSError(ENAMETOOLONG) instead of returning False, which failed the whole
+# publish. POSIX limits one path component to 255 bytes and a full path to
+# PATH_MAX, so anything longer cannot name a file that exists.
+_MAX_NAME_BYTES = 255
+_MAX_PATH_BYTES = 4096
+
+
+def _is_plausible_filename(value: str) -> bool:
+    if not value or "\n" in value or "\x00" in value:
+        return False
+    if len(value.encode("utf-8", "surrogatepass")) > _MAX_PATH_BYTES:
+        return False
+    components = [part for part in value.replace("\\", "/").split("/") if part]
+    if not components:
+        return False
+    return all(
+        len(part.encode("utf-8", "surrogatepass")) <= _MAX_NAME_BYTES for part in components
+    )
+
+
 def _resolve_model(filename: str, model_type: str) -> tuple[Path, str] | None:
+    if not _is_plausible_filename(filename):
+        return None
     aliases = {
         "checkpoint": "checkpoints",
         "lora": "loras",
@@ -175,22 +201,34 @@ def _resolve_model(filename: str, model_type: str) -> tuple[Path, str] | None:
         roots = []
     target = filename.replace("\\", "/").lstrip("/")
     for raw_root in roots:
-        root = Path(raw_root).resolve()
-        direct = (root / target).resolve()
-        if direct.is_file() and root in direct.parents:
-            try:
-                relative_parent = direct.parent.relative_to(Path(folder_paths.base_path).resolve())
-                return direct, str(relative_parent).replace("\\", "/")
-            except ValueError:
-                return direct, f"models/{model_type}"
-        for candidate in root.rglob(Path(target).name):
-            resolved = candidate.resolve()
-            if resolved.is_file() and root in resolved.parents:
+        # A model root can be missing, unreadable or a broken symlink on
+        # someone else's install. One bad root must not fail the publish.
+        try:
+            root = Path(raw_root).resolve()
+            direct = (root / target).resolve()
+            if direct.is_file() and root in direct.parents:
                 try:
-                    relative_parent = resolved.parent.relative_to(Path(folder_paths.base_path).resolve())
-                    return resolved, str(relative_parent).replace("\\", "/")
+                    relative_parent = direct.parent.relative_to(
+                        Path(folder_paths.base_path).resolve()
+                    )
+                    return direct, str(relative_parent).replace("\\", "/")
                 except ValueError:
-                    return resolved, f"models/{model_type}/{resolved.parent.relative_to(root)}".rstrip("/")
+                    return direct, f"models/{model_type}"
+            for candidate in root.rglob(Path(target).name):
+                resolved = candidate.resolve()
+                if resolved.is_file() and root in resolved.parents:
+                    try:
+                        relative_parent = resolved.parent.relative_to(
+                            Path(folder_paths.base_path).resolve()
+                        )
+                        return resolved, str(relative_parent).replace("\\", "/")
+                    except ValueError:
+                        return (
+                            resolved,
+                            f"models/{model_type}/{resolved.parent.relative_to(root)}".rstrip("/"),
+                        )
+        except OSError:
+            continue
     return None
 
 
