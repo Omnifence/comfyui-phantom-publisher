@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.5.0"
+PUBLISHER_VERSION = "0.5.1"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -51,6 +51,22 @@ def _job_log(
     )
     if len(logs) > PUBLISH_LOG_LIMIT:
         del logs[: len(logs) - PUBLISH_LOG_LIMIT]
+
+
+def _log_server_warnings(job: dict[str, Any], version: Any) -> None:
+    """
+    Surface advisory `warnings` Phantom attaches to a version response — e.g.
+    "this machine's ComfyUI core is newer than every base image the platform
+    knows". The field is additive: an older server sends none, and anything
+    that is not a list of strings is ignored rather than failing a publish
+    that already carries real artifacts.
+    """
+    warnings = version.get("warnings") if isinstance(version, dict) else None
+    if not isinstance(warnings, list):
+        return
+    for warning in warnings:
+        if isinstance(warning, str) and warning:
+            _job_log(job, warning, level="warning")
 
 
 def _job_step(job: dict[str, Any], message: str, **fields: Any) -> None:
@@ -1153,6 +1169,7 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
         )
         version_id = version["workflow_version_id"]
         _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
+        _log_server_warnings(job, version)
         completed_upload_bytes = 0
         for index, (digest, path, size, dependency) in enumerate(uploads):
             dependency.update(status="uploading", progress=0, uploaded_bytes=0)
@@ -1223,6 +1240,7 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
             current_dependency_id=None,
         )
         version = await _phantom_request("POST", f"/versions/{version_id}/finalize", config)
+        _log_server_warnings(job, version)
         _job_step(
             job,
             f"Version v{version['version']} is ready for review.",
