@@ -26,6 +26,27 @@ def _load_publisher():
     aiohttp = types.ModuleType("aiohttp")
     aiohttp.web = types.ModuleType("aiohttp.web")
     aiohttp.ClientTimeout = lambda **fields: types.SimpleNamespace(**fields)
+
+    # The real hierarchy, only as deep as the publisher relies on it:
+    # ClientConnectorDNSError — the failure this module retries — is a
+    # ClientConnectionError, and both connection and payload errors are
+    # ClientErrors.
+    class ClientError(Exception):
+        pass
+
+    class ClientConnectionError(ClientError):
+        pass
+
+    class ClientConnectorDNSError(ClientConnectionError):
+        pass
+
+    class ClientPayloadError(ClientError):
+        pass
+
+    aiohttp.ClientError = ClientError
+    aiohttp.ClientConnectionError = ClientConnectionError
+    aiohttp.ClientConnectorDNSError = ClientConnectorDNSError
+    aiohttp.ClientPayloadError = ClientPayloadError
     sys.modules["aiohttp"] = aiohttp
     sys.modules["aiohttp.web"] = aiohttp.web
 
@@ -390,9 +411,22 @@ class ClientTimeoutTests(unittest.TestCase):
         # failed a 28 GB publish after every byte had already landed.
         timeout = publisher._client_timeout()
         self.assertIsNone(timeout.total)
-        self.assertIsNone(timeout.connect)
         self.assertEqual(timeout.sock_connect, 30)
         self.assertEqual(timeout.sock_read, 15 * 60)
+
+    def test_bounds_name_resolution(self):
+        # `connect` is the only field that covers DNS resolution — aiohttp
+        # applies `sock_connect` to the handshake alone. Leaving it None let a
+        # stalled resolver hold a 28 GB publish for 20 minutes before it
+        # reported "Name or service not known".
+        timeout = publisher._client_timeout()
+        self.assertEqual(timeout.connect, 60)
+
+    def test_backoff_is_exponential_and_capped(self):
+        self.assertEqual(
+            [publisher._backoff_seconds(attempt) for attempt in range(6)],
+            [1.0, 2.0, 4.0, 8.0, 16.0, 30.0],
+        )
 
 
 class PipDependencyCaptureTests(unittest.TestCase):
@@ -726,7 +760,9 @@ class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
         # Finalizing is free to retry: every part is already in the object
         # store, so a repeat sends no bytes.
         complete = next(path for path in requested_paths if path.endswith("/complete"))
-        self.assertEqual(request_options[complete]["transient_retries"], 3)
+        self.assertEqual(
+            request_options[complete]["transient_retries"], publisher._TRANSIENT_RETRIES
+        )
 
 
 class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
@@ -956,6 +992,231 @@ class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
 
         # The proxy's own text, not a generic "Request failed".
         self.assertIn("Bad Request", str(caught.exception))
+
+
+class TransientNetworkFailureTests(unittest.IsolatedAsyncioTestCase):
+    """
+    A DNS, TCP or TLS failure never produces a status code, so the status-based
+    retry never saw it: the exception escaped the loop and failed the publish
+    outright. A 28 GB run died that way after 20 minutes and 7 of 12 uploaded
+    dependencies, on a resolver that was answering again seconds later.
+    """
+
+    def setUp(self):
+        self._original_session = getattr(publisher.aiohttp, "ClientSession", None)
+        self._original_sleep = publisher.asyncio.sleep
+        self.sleeps: list[float] = []
+
+        async def sleep(delay):
+            self.sleeps.append(delay)
+
+        publisher.asyncio.sleep = sleep
+
+    def tearDown(self):
+        publisher.asyncio.sleep = self._original_sleep
+        if self._original_session is None:
+            publisher.aiohttp.ClientSession = None
+            del publisher.aiohttp.ClientSession
+        else:
+            publisher.aiohttp.ClientSession = self._original_session
+
+    def _dns_error(self):
+        return publisher.aiohttp.ClientConnectorDNSError(
+            "Cannot connect to host api.phantomrouter.ai:443 ssl:default "
+            "[Name or service not known]"
+        )
+
+    async def test_retries_a_dns_failure_and_succeeds(self):
+        attempts: list[int] = []
+        error = self._dns_error()
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            async def text(self):
+                return '{"ok": true}'
+
+        class Session:
+            def __init__(self, *, headers, timeout=None):
+                self.headers = headers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def request(self, _method, _url, **_options):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise error
+                return Response()
+
+        publisher.aiohttp.ClientSession = Session
+        result = await publisher._phantom_request(
+            "POST",
+            "/versions/version-id/artifacts/digest/uploads",
+            {"origin": "https://api.phantomrouter.ai", "token": "php_secret"},
+            {"byte_size": 42},
+            transient_retries=publisher._TRANSIENT_RETRIES,
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.sleeps, [1.0])
+
+    async def test_reports_the_host_after_every_attempt_fails(self):
+        attempts: list[int] = []
+        error = self._dns_error()
+
+        class Session:
+            def __init__(self, *, headers, timeout=None):
+                self.headers = headers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def request(self, _method, _url, **_options):
+                attempts.append(1)
+                raise error
+
+        publisher.aiohttp.ClientSession = Session
+        with self.assertRaises(RuntimeError) as caught:
+            await publisher._phantom_request(
+                "POST",
+                "/versions/version-id/artifacts/digest/uploads",
+                {"origin": "https://api.phantomrouter.ai", "token": "php_secret"},
+                {"byte_size": 42},
+                transient_retries=2,
+            )
+
+        self.assertEqual(len(attempts), 3)
+        self.assertIn("could not reach https://api.phantomrouter.ai", str(caught.exception))
+        self.assertIn("Name or service not known", str(caught.exception))
+
+    async def test_a_dropped_part_upload_is_re_signed_and_resent(self):
+        # The presigned URL is short-lived, so an attempt that waited out a
+        # backoff can outlive it. Replaying the dead URL would turn one dropped
+        # packet into a failed multi-gigabyte upload.
+        signed_urls = [
+            "https://uploads.test/part-1?sig=first",
+            "https://uploads.test/part-1?sig=second",
+        ]
+        requested: list[str] = []
+        put_urls: list[str] = []
+        error = publisher.aiohttp.ClientConnectionError("Server disconnected")
+
+        async def request(_method, path, _config, _body=None, **_options):
+            requested.append(path)
+            return {"upload_url": signed_urls[len(requested) - 1]}
+
+        class Response:
+            status = 200
+            headers = {"ETag": "uploaded"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+        class Session:
+            def __init__(self, *, timeout=None, **_options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def put(self, url, *, data):
+                put_urls.append(url)
+                if len(put_urls) == 1:
+                    raise error
+                return Response()
+
+        original_request = publisher._phantom_request
+        publisher._phantom_request = request
+        publisher.aiohttp.ClientSession = Session
+        try:
+            part = await publisher._put_part(
+                "version-id",
+                "a" * 64,
+                1,
+                b"0123",
+                {"origin": "https://api.phantomrouter.ai", "token": "php_secret"},
+            )
+        finally:
+            publisher._phantom_request = original_request
+
+        self.assertEqual(part, {"PartNumber": 1, "ETag": "uploaded"})
+        self.assertEqual(put_urls, signed_urls)
+        self.assertEqual(len(requested), 2)
+        self.assertEqual(self.sleeps, [1.0])
+
+    async def test_a_rejected_part_upload_fails_without_retrying(self):
+        # 403 means the request itself is wrong. Repeating it five times only
+        # delays the report.
+        attempts: list[int] = []
+
+        async def request(_method, _path, _config, _body=None, **_options):
+            return {"upload_url": "https://uploads.test/part-1"}
+
+        class Response:
+            status = 403
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            async def text(self):
+                return "SignatureDoesNotMatch"
+
+        class Session:
+            def __init__(self, *, timeout=None, **_options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def put(self, _url, *, data):
+                attempts.append(1)
+                return Response()
+
+        original_request = publisher._phantom_request
+        publisher._phantom_request = request
+        publisher.aiohttp.ClientSession = Session
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                await publisher._put_part(
+                    "version-id",
+                    "a" * 64,
+                    1,
+                    b"0123",
+                    {"origin": "https://api.phantomrouter.ai", "token": "php_secret"},
+                )
+        finally:
+            publisher._phantom_request = original_request
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("SignatureDoesNotMatch", str(caught.exception))
 
 
 if __name__ == "__main__":

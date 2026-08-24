@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.4.1"
+PUBLISHER_VERSION = "0.4.2"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -692,17 +692,49 @@ def _parse_json_body(raw: str) -> Any | None:
 # byte had already landed. Cap the phases that genuinely indicate a dead
 # connection instead of the total, so a slow answer is waited out and a stalled
 # socket still fails fast.
-_CONNECT_TIMEOUT_SECONDS = 30
+#
+# `connect` must stay bounded. It is the only field that covers DNS resolution:
+# aiohttp applies `sock_connect` to the TCP and TLS handshake alone, and wraps
+# name resolution in `connect`. With `connect=None` a resolver that stops
+# answering — a laptop changing networks, a container losing its nameserver —
+# blocks the publish for as long as the OS takes to give up. That cost a
+# 28 GB publish 20 minutes of silence before it reported a DNS failure.
+_CONNECT_TIMEOUT_SECONDS = 60
+_SOCKET_CONNECT_TIMEOUT_SECONDS = 30
 _READ_TIMEOUT_SECONDS = 15 * 60
+
+# A publish runs for hours and carries tens of gigabytes, so a network blip
+# that lasts seconds must not throw the whole run away. Five retries spend
+# 1 + 2 + 4 + 8 + 16 seconds waiting, which outlasts a resolver restart or a
+# reconnecting VPN without leaving a genuinely dead host hanging for minutes.
+_TRANSIENT_RETRIES = 5
+_MAX_BACKOFF_SECONDS = 30.0
+
+# DNS, TCP, TLS and mid-body failures never produce a status code, so the
+# status-based retry below never saw them: they escaped the loop as exceptions
+# and failed the publish outright. `ClientConnectionError` covers the connector
+# errors (`ClientConnectorDNSError`, `ServerDisconnectedError`, `ClientOSError`
+# among them); `ClientPayloadError` covers a response body that stops
+# mid-stream.
+_TRANSIENT_NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    asyncio.TimeoutError,
+)
 
 
 def _client_timeout() -> Any:
     return aiohttp.ClientTimeout(
         total=None,
-        connect=None,
-        sock_connect=_CONNECT_TIMEOUT_SECONDS,
+        connect=_CONNECT_TIMEOUT_SECONDS,
+        sock_connect=_SOCKET_CONNECT_TIMEOUT_SECONDS,
         sock_read=_READ_TIMEOUT_SECONDS,
     )
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff, capped so a long retry sequence stays bounded."""
+    return min(float(2**attempt), _MAX_BACKOFF_SECONDS)
 
 
 async def _phantom_request(
@@ -723,41 +755,49 @@ async def _phantom_request(
     # connection pays another TCP + TLS handshake before it can even try.
     async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout()) as session:
         for attempt in range(total_attempts):
-            # aiohttp 3.13 sends `Content-Type: application/octet-stream` for an
-            # otherwise bodyless POST, even when no `data`/`json` argument is
-            # supplied. Fastify rejects that before finalize and multipart-part
-            # presign handlers can run, so mutation requests carry `{}` explicitly.
-            async with session.request(
-                method,
-                f"{config['origin'].rstrip('/')}/api/v1/phantom/comfyui-publisher{path}",
-                **request_options,
-            ) as response:
-                # Read the body as TEXT and parse it ourselves. `response.json()`
-                # raises ContentTypeError on the HTML or plain-text 502/503 a
-                # reverse proxy returns, and that exception escapes the loop —
-                # so the one class of failure these retries exist for was the
-                # one class that never retried.
-                raw = await response.text()
-                payload = _parse_json_body(raw)
-                if response.status < 400:
-                    if payload is None:
+            last_attempt = attempt == total_attempts - 1
+            try:
+                # aiohttp 3.13 sends `Content-Type: application/octet-stream` for an
+                # otherwise bodyless POST, even when no `data`/`json` argument is
+                # supplied. Fastify rejects that before finalize and multipart-part
+                # presign handlers can run, so mutation requests carry `{}` explicitly.
+                async with session.request(
+                    method,
+                    f"{config['origin'].rstrip('/')}/api/v1/phantom/comfyui-publisher{path}",
+                    **request_options,
+                ) as response:
+                    # Read the body as TEXT and parse it ourselves. `response.json()`
+                    # raises ContentTypeError on the HTML or plain-text 502/503 a
+                    # reverse proxy returns, and that exception escapes the loop —
+                    # so the one class of failure these retries exist for was the
+                    # one class that never retried.
+                    raw = await response.text()
+                    payload = _parse_json_body(raw)
+                    if response.status < 400:
+                        if payload is None:
+                            raise RuntimeError(
+                                f"Phantom {method.upper()} {path} returned HTTP "
+                                f"{response.status} with a non-JSON body: {raw.strip()[:200]}"
+                            )
+                        return payload
+                    message = (
+                        (payload.get("message") or payload.get("error"))
+                        if isinstance(payload, dict)
+                        else None
+                    ) or (raw.strip()[:200] or "Request failed")
+                    retryable = response.status == 429 or response.status >= 500
+                    if not retryable or last_attempt:
                         raise RuntimeError(
                             f"Phantom {method.upper()} {path} returned HTTP "
-                            f"{response.status} with a non-JSON body: {raw.strip()[:200]}"
+                            f"{response.status}: {message}"
                         )
-                    return payload
-                message = (
-                    (payload.get("message") or payload.get("error"))
-                    if isinstance(payload, dict)
-                    else None
-                ) or (raw.strip()[:200] or "Request failed")
-                retryable = response.status == 429 or response.status >= 500
-                if not retryable or attempt == total_attempts - 1:
+            except _TRANSIENT_NETWORK_ERRORS as error:
+                if last_attempt:
                     raise RuntimeError(
-                        f"Phantom {method.upper()} {path} returned HTTP "
-                        f"{response.status}: {message}"
-                    )
-            delay = float(2**attempt)
+                        f"Phantom {method.upper()} {path} could not reach "
+                        f"{config['origin']}: {error}"
+                    ) from error
+            delay = _backoff_seconds(attempt)
             if on_retry:
                 on_retry(attempt + 2, total_attempts, delay)
             await asyncio.sleep(delay)
@@ -838,6 +878,64 @@ def _part_bytes(part_number: int, part_size: int, total_size: int) -> int:
     return min(part_size, max(0, total_size - ((part_number - 1) * part_size)))
 
 
+async def _put_part(
+    version_id: str,
+    digest: str,
+    part_number: int,
+    chunk: bytes,
+    config: dict[str, Any],
+    on_retry: Callable[[int, int, float], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Send one part to the object store, and sign a fresh URL for every attempt.
+
+    A part carries the same bytes to the same slot each time, so a repeat is
+    safe. The presigned URL expires, though, and an attempt that waited out a
+    backoff can outlive it — so each attempt asks Phantom for a new URL rather
+    than replaying one that may already be dead.
+    """
+    total_attempts = _TRANSIENT_RETRIES + 1
+    for attempt in range(total_attempts):
+        last_attempt = attempt == total_attempts - 1
+        signed = await _phantom_request(
+            "POST",
+            f"/versions/{version_id}/artifacts/{digest}/uploads/parts/{part_number}",
+            config,
+            transient_retries=_TRANSIENT_RETRIES,
+            on_retry=on_retry,
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=_client_timeout()) as session:
+                async with session.put(signed["upload_url"], data=chunk) as response:
+                    if response.status < 400:
+                        return {
+                            "PartNumber": part_number,
+                            "ETag": response.headers.get("ETag", ""),
+                        }
+                    response_detail = (await response.text()).strip()
+                    suffix = f": {response_detail[:500]}" if response_detail else ""
+                    retryable = response.status == 429 or response.status >= 500
+                    if not retryable or last_attempt:
+                        raise RuntimeError(
+                            f"Artifact part {part_number} upload failed with HTTP "
+                            f"{response.status}{suffix}"
+                        )
+        except _TRANSIENT_NETWORK_ERRORS as error:
+            if last_attempt:
+                raise RuntimeError(
+                    f"Artifact part {part_number} upload could not reach the "
+                    f"object store: {error}"
+                ) from error
+        delay = _backoff_seconds(attempt)
+        if on_retry:
+            on_retry(attempt + 2, total_attempts, delay)
+        await asyncio.sleep(delay)
+
+    raise RuntimeError(
+        f"Artifact part {part_number} upload failed after {total_attempts} attempts"
+    )
+
+
 async def _upload(
     version_id: str,
     digest: str,
@@ -852,7 +950,7 @@ async def _upload(
         f"/versions/{version_id}/artifacts/{digest}/uploads",
         config,
         {"byte_size": size},
-        transient_retries=3,
+        transient_retries=_TRANSIENT_RETRIES,
         on_retry=on_retry,
     )
     if started.get("reused"):
@@ -873,26 +971,14 @@ async def _upload(
         part_number = 1
         while chunk := handle.read(part_size):
             if part_number not in completed:
-                signed = await _phantom_request(
-                    "POST",
-                    f"/versions/{version_id}/artifacts/{digest}/uploads/parts/{part_number}",
+                completed[part_number] = await _put_part(
+                    version_id,
+                    digest,
+                    part_number,
+                    chunk,
                     config,
-                    transient_retries=3,
                     on_retry=on_retry,
                 )
-                async with aiohttp.ClientSession(timeout=_client_timeout()) as session:
-                    async with session.put(signed["upload_url"], data=chunk) as response:
-                        if response.status >= 400:
-                            response_detail = (await response.text()).strip()
-                            suffix = f": {response_detail[:500]}" if response_detail else ""
-                            raise RuntimeError(
-                                f"Artifact part {part_number} upload failed with HTTP "
-                                f"{response.status}{suffix}"
-                            )
-                        completed[part_number] = {
-                            "PartNumber": part_number,
-                            "ETag": response.headers.get("ETag", ""),
-                        }
                 uploaded_bytes += len(chunk)
             if on_progress:
                 on_progress(uploaded_bytes, size, False)
@@ -904,7 +990,7 @@ async def _upload(
         f"/versions/{version_id}/artifacts/{digest}/uploads/complete",
         config,
         {"parts": [completed[key] for key in sorted(completed)]},
-        transient_retries=3,
+        transient_retries=_TRANSIENT_RETRIES,
         on_retry=on_retry,
     )
     if on_progress:
@@ -1041,7 +1127,7 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
 
             def report_retry(next_attempt: int, total_attempts: int, delay: float) -> None:
                 message = (
-                    f"Phantom was temporarily unavailable. Retrying {dependency['name']} "
+                    f"The connection to Phantom failed. Retrying {dependency['name']} "
                     f"in {delay:g}s (attempt {next_attempt} of {total_attempts})…"
                 )
                 job.update(message=message)
