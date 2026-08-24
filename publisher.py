@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.4.0"
+PUBLISHER_VERSION = "0.4.1"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -686,6 +686,25 @@ def _parse_json_body(raw: str) -> Any | None:
         return None
 
 
+# aiohttp caps every request at 5 minutes unless told otherwise, and finalizing
+# a multi-gigabyte artifact takes longer than that: Phantom hashes the whole
+# object before it answers. That default failed a 28 GB publish after every
+# byte had already landed. Cap the phases that genuinely indicate a dead
+# connection instead of the total, so a slow answer is waited out and a stalled
+# socket still fails fast.
+_CONNECT_TIMEOUT_SECONDS = 30
+_READ_TIMEOUT_SECONDS = 15 * 60
+
+
+def _client_timeout() -> Any:
+    return aiohttp.ClientTimeout(
+        total=None,
+        connect=None,
+        sock_connect=_CONNECT_TIMEOUT_SECONDS,
+        sock_read=_READ_TIMEOUT_SECONDS,
+    )
+
+
 async def _phantom_request(
     method: str,
     path: str,
@@ -702,7 +721,7 @@ async def _phantom_request(
     total_attempts = transient_retries + 1
     # One session for the whole retry sequence: a retry that reopens the
     # connection pays another TCP + TLS handshake before it can even try.
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout()) as session:
         for attempt in range(total_attempts):
             # aiohttp 3.13 sends `Content-Type: application/octet-stream` for an
             # otherwise bodyless POST, even when no `data`/`json` argument is
@@ -861,7 +880,7 @@ async def _upload(
                     transient_retries=3,
                     on_retry=on_retry,
                 )
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(timeout=_client_timeout()) as session:
                     async with session.put(signed["upload_url"], data=chunk) as response:
                         if response.status >= 400:
                             response_detail = (await response.text()).strip()
@@ -878,11 +897,15 @@ async def _upload(
             if on_progress:
                 on_progress(uploaded_bytes, size, False)
             part_number += 1
+    # Finalizing is the one request that can be retried for free: every part is
+    # already in the object store, so a repeat sends no bytes.
     await _phantom_request(
         "POST",
         f"/versions/{version_id}/artifacts/{digest}/uploads/complete",
         config,
         {"parts": [completed[key] for key in sorted(completed)]},
+        transient_retries=3,
+        on_retry=on_retry,
     )
     if on_progress:
         on_progress(size, size, False)
