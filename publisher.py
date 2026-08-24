@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.4.2"
+PUBLISHER_VERSION = "0.5.0"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -142,6 +142,15 @@ def _git_metadata(directory: Path) -> dict[str, Any]:
             ).strip()
         except (OSError, subprocess.SubprocessError):
             return None
+
+    # `git -C` walks up until it finds A repository, not THIS package's. A
+    # hand-copied folder inside a ComfyUI checkout therefore reported ComfyUI's
+    # own URL, commit and dirty flag — provenance for the wrong code. Only a
+    # package that is its own checkout has Git provenance; anything else is a
+    # local copy, and `dirty` stays true because its content matches no commit.
+    toplevel = run("rev-parse", "--show-toplevel")
+    if not toplevel or Path(toplevel).resolve() != directory.resolve():
+        return {"git_commit": None, "repository_url": None, "dirty": True}
 
     commit = run("rev-parse", "HEAD")
     remote = _safe_url(run("remote", "get-url", "origin"))
@@ -291,18 +300,12 @@ def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) 
     return list(discovered.values())
 
 
-def _package_directory(cnr_id: str | None, class_types: list[str]) -> Path | None:
-    custom_nodes = Path(folder_paths.get_folder_paths("custom_nodes")[0])
-    needle = (cnr_id or "").lower().replace("-", "_")
-    for directory in custom_nodes.iterdir() if custom_nodes.exists() else []:
-        if not directory.is_dir():
-            continue
-        if needle and needle in directory.name.lower().replace("-", "_"):
-            return directory
-        mappings = directory / "__init__.py"
-        if mappings.exists() and any(class_type in mappings.read_text(errors="ignore") for class_type in class_types):
-            return directory
-    return None
+def _normalized_package_name(value: str) -> str:
+    return value.lower().replace("-", "_")
+
+
+def _label_matches_directory(cnr_id: str, directory: Path) -> bool:
+    return _normalized_package_name(cnr_id) in _normalized_package_name(directory.name)
 
 
 def _comfyui_provided_distributions() -> set[str]:
@@ -602,70 +605,123 @@ def _discover_huggingface_models(
     return discovered
 
 
+def _class_source_file(nodes_module: Any, class_type: str) -> tuple[Path | None, str | None]:
+    """The file that defines a registered node class, via its class object."""
+    node_class = nodes_module.NODE_CLASS_MAPPINGS.get(class_type)
+    if node_class is None:
+        return None, None
+    module_name = getattr(node_class, "__module__", None)
+    module = sys.modules.get(module_name) if module_name else None
+    if module is None and module_name:
+        try:
+            module = __import__(module_name, fromlist=["__file__"])
+        except ImportError:
+            module = None
+    module_file = getattr(module, "__file__", None) if module else None
+    return (Path(module_file).resolve() if module_file else None), module_name
+
+
 def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) -> list[dict[str, Any]]:
     import nodes
 
+    # The archived directory always comes from the CLASS OBJECT, never from the
+    # frontend's `properties.cnr_id` label. The label is whatever ComfyUI's
+    # registry said at save time, and one broken third-party package can rewrite
+    # that registry for every node loaded before it (`from nodes import *` in a
+    # package __init__ re-exports ComfyUI's global NODE_CLASS_MAPPINGS, and the
+    # loader then re-attributes every class to that package). A class's
+    # `__module__` is stamped at definition and survives any re-registration,
+    # so the file it names is the ground truth for what bytes to upload.
+    # Grouping by resolved file also IS the pre-upload invariant: every class a
+    # package claims resolves to a file inside that package's directory.
     ui_nodes = _node_properties(ui_workflow)
-    grouped: dict[tuple[str | None, str | None, str | None], set[str]] = {}
     custom_roots = [Path(root).resolve() for root in folder_paths.get_folder_paths("custom_nodes")]
+    comfy_root = Path(folder_paths.base_path).resolve()
+
+    grouped: dict[str, dict[str, Any]] = {}
     for node_id, raw_node in api_workflow.items():
         if not isinstance(raw_node, dict) or not isinstance(raw_node.get("class_type"), str):
             continue
+        class_type = raw_node["class_type"]
         ui_node = ui_nodes.get(str(node_id), {})
         properties = ui_node.get("properties", {}) if isinstance(ui_node, dict) else {}
         cnr_id = properties.get("cnr_id") if isinstance(properties, dict) else None
         version = properties.get("ver") if isinstance(properties, dict) else None
-        if cnr_id == "comfy-core":
-            continue
+
+        module_file, module_name = _class_source_file(nodes, class_type)
+        if module_file is None:
+            # Publishing anyway would promise code that is never uploaded, and
+            # the lie only surfaces after a full image build.
+            raise RuntimeError(
+                f'Node class "{class_type}" cannot be resolved to a source file '
+                f'(module: {module_name or "not registered in this ComfyUI"}). '
+                "The package that defines it is absent or failed to import, so "
+                "this workflow cannot be published from this machine."
+            )
+
         directory: Path | None = None
-        if not cnr_id:
-            node_class = nodes.NODE_CLASS_MAPPINGS.get(raw_node["class_type"])
-            module = __import__(node_class.__module__, fromlist=["__file__"]) if node_class else None
-            module_file = Path(module.__file__).resolve() if module and getattr(module, "__file__", None) else None
-            if module_file:
-                for root in custom_roots:
-                    if root in module_file.parents:
-                        directory = root / module_file.relative_to(root).parts[0]
-                        break
-            if not directory:
+        for root in custom_roots:
+            if root in module_file.parents:
+                directory = root / module_file.relative_to(root).parts[0]
+                break
+        if directory is None:
+            # Core-ness is also derived from the resolved path, not from a
+            # `comfy-core` label — the label lies exactly when it matters.
+            if comfy_root == module_file or comfy_root in module_file.parents:
                 continue
-        key = (str(cnr_id) if cnr_id else None, str(version) if version else None, str(directory) if directory else None)
-        grouped.setdefault(key, set()).add(raw_node["class_type"])
+            raise RuntimeError(
+                f'Node class "{class_type}" is defined in "{module_file}", outside both '
+                "custom_nodes and the ComfyUI installation, so it cannot be packaged."
+            )
+
+        entry = grouped.setdefault(
+            str(directory), {"classes": set(), "labels": [], "mismatches": [], "files": set()}
+        )
+        entry["classes"].add(class_type)
+        entry["files"].add(str(module_file))
+        if isinstance(cnr_id, str) and cnr_id:
+            if cnr_id != "comfy-core" and _label_matches_directory(cnr_id, directory):
+                entry["labels"].append((cnr_id, str(version) if version else None))
+            else:
+                # Keep the disagreement visible: this is how we find out how
+                # often a hijacked registry happens in the wild.
+                entry["mismatches"].append({"class_type": class_type, "labeled_cnr_id": cnr_id})
 
     result: list[dict[str, Any]] = []
-    for (cnr_id, version, explicit_directory), classes in grouped.items():
-        directory = Path(explicit_directory) if explicit_directory else _package_directory(cnr_id, sorted(classes))
-        git = _git_metadata(directory) if directory else {"git_commit": None, "repository_url": None, "dirty": False}
+    for directory_key in sorted(grouped):
+        entry = grouped[directory_key]
+        directory = Path(directory_key)
+        # Registry coordinates stay as PROVENANCE when the label agrees with the
+        # resolved directory; a disagreeing label never names the directory and
+        # never rides along as provenance either.
+        cnr_id, version = next(iter(entry["labels"]), (None, None))
         package: dict[str, Any] = {
-            "class_types": sorted(classes),
+            "class_types": sorted(entry["classes"]),
             "cnr_id": cnr_id,
             "version": version,
-            "pip_dependencies": _pip_dependencies(directory) if directory else [],
-            **git,
+            "pip_dependencies": _pip_dependencies(directory),
+            **_git_metadata(directory),
             "archive_sha256": None,
-            "_package_directory": str(directory) if directory else None,
-            "_source_files": [],
+            "_package_directory": str(directory),
+            "_source_files": sorted(entry["files"]),
         }
-        for class_type in classes:
-            node_class = nodes.NODE_CLASS_MAPPINGS.get(class_type)
-            module = sys.modules.get(node_class.__module__) if node_class else None
-            module_file = getattr(module, "__file__", None)
-            if module_file:
-                package["_source_files"].append(str(Path(module_file).resolve()))
+        if entry["mismatches"]:
+            package["attribution_mismatches"] = sorted(
+                entry["mismatches"], key=lambda item: item["class_type"]
+            )
         # Snapshot every used custom-node package, including clean Registry and
         # Git installs. Registry/Git coordinates remain useful provenance, but
         # they are not an immutable source of truth: releases, repositories, and
         # commits can be removed. The normalized archive is content-addressed by
         # Phantom and is therefore what a workflow-version build consumes.
-        if directory:
-            archive, digest, size = _archive_package(directory)
-            package.update(
-                {
-                    "archive_sha256": digest,
-                    "_archive_path": str(archive),
-                    "_archive_size": size,
-                }
-            )
+        archive, digest, size = _archive_package(directory)
+        package.update(
+            {
+                "archive_sha256": digest,
+                "_archive_path": str(archive),
+                "_archive_size": size,
+            }
+        )
         result.append(package)
     return result
 

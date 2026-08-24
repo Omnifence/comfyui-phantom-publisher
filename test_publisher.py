@@ -94,46 +94,6 @@ class PublisherDiscoveryTests(unittest.TestCase):
                 first_path.unlink(missing_ok=True)
                 second_path.unlink(missing_ok=True)
 
-    def test_clean_registry_package_is_archived_for_phantom_source_of_truth(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            package = Path(temporary) / "clean-registry-package"
-            package.mkdir()
-            (package / "node.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
-            original_package_directory = publisher._package_directory
-            original_git_metadata = publisher._git_metadata
-            original_pip_dependencies = publisher._pip_dependencies
-            publisher._package_directory = lambda _cnr_id, _classes: package
-            publisher._git_metadata = lambda _directory: {
-                "git_commit": "a" * 40,
-                "repository_url": "https://github.com/example/package",
-                "dirty": False,
-            }
-            publisher._pip_dependencies = lambda _directory: []
-            sys.modules["nodes"] = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
-            try:
-                packages = publisher._discover_packages(
-                    {"1": {"class_type": "ExampleNode", "inputs": {}}},
-                    {
-                        "nodes": [
-                            {
-                                "id": 1,
-                                "properties": {"cnr_id": "example-package", "ver": "1.2.3"},
-                            }
-                        ]
-                    },
-                )
-            finally:
-                publisher._package_directory = original_package_directory
-                publisher._git_metadata = original_git_metadata
-                publisher._pip_dependencies = original_pip_dependencies
-
-            self.assertEqual(len(packages), 1)
-            discovered = packages[0]
-            self.assertFalse(discovered["dirty"])
-            self.assertRegex(discovered["archive_sha256"], r"^[a-f0-9]{64}$")
-            self.assertGreater(discovered["_archive_size"], 0)
-            Path(discovered["_archive_path"]).unlink(missing_ok=True)
-
     def test_detects_literal_huggingface_model_used_inside_a_node_package(self):
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary)
@@ -280,6 +240,220 @@ class PublisherDiscoveryTests(unittest.TestCase):
                     publisher.folder_paths.folder_names_and_paths = original_names
 
             self.assertEqual([model["filename"] for model in models], ["primary.safetensors"])
+
+
+class _CustomNodesEnvironment:
+    """
+    A fake ComfyUI install for package discovery: a base path, one custom_nodes
+    root, and a `nodes.NODE_CLASS_MAPPINGS` whose class objects resolve to real
+    files — the same chain `_discover_packages` walks in production.
+    """
+
+    def __init__(self, testcase: unittest.TestCase):
+        temporary = tempfile.TemporaryDirectory()
+        testcase.addCleanup(temporary.cleanup)
+        self.testcase = testcase
+        self.root = Path(temporary.name)
+        self.custom_nodes = self.root / "custom_nodes"
+        self.custom_nodes.mkdir()
+        self.mappings: dict[str, type] = {}
+        self._original_base = publisher.folder_paths.base_path
+        self._original_get_paths = publisher.folder_paths.get_folder_paths
+        publisher.folder_paths.base_path = str(self.root)
+        publisher.folder_paths.get_folder_paths = lambda kind: (
+            [str(self.custom_nodes)] if kind == "custom_nodes" else []
+        )
+        testcase.addCleanup(self._restore)
+        sys.modules["nodes"] = types.SimpleNamespace(NODE_CLASS_MAPPINGS=self.mappings)
+        testcase.addCleanup(sys.modules.pop, "nodes", None)
+
+    def _restore(self) -> None:
+        publisher.folder_paths.base_path = self._original_base
+        publisher.folder_paths.get_folder_paths = self._original_get_paths
+
+    def register_class(self, class_type: str, source: Path) -> None:
+        module_name = f"phantom_test_module_{class_type.lower()}"
+        module = types.ModuleType(module_name)
+        module.__file__ = str(source)
+        sys.modules[module_name] = module
+        self.testcase.addCleanup(sys.modules.pop, module_name, None)
+        self.mappings[class_type] = type(class_type, (), {"__module__": module_name})
+
+    def package(self, name: str, class_types: list[str]) -> Path:
+        directory = self.custom_nodes / name
+        directory.mkdir()
+        source = directory / "nodes_impl.py"
+        source.write_text(
+            "".join(f"class {class_type}:\n    pass\n" for class_type in class_types),
+            encoding="utf-8",
+        )
+        for class_type in class_types:
+            self.register_class(class_type, source)
+        return directory
+
+    def core_class(self, class_type: str) -> None:
+        source = self.root / "comfy_extras" / "nodes_core.py"
+        source.parent.mkdir(exist_ok=True)
+        source.touch()
+        self.register_class(class_type, source)
+
+
+def _workflow(nodes_spec: list[tuple[str, dict[str, Any]]]):
+    api: dict[str, Any] = {}
+    ui: dict[str, Any] = {"nodes": []}
+    for index, (class_type, properties) in enumerate(nodes_spec, start=1):
+        api[str(index)] = {"class_type": class_type, "inputs": {}}
+        ui["nodes"].append({"id": index, "properties": properties})
+    return api, ui
+
+
+class PackageAttributionTests(unittest.TestCase):
+    """
+    The frontend's `properties.cnr_id` label is whatever ComfyUI's registry said
+    at save time, and one broken package (`from nodes import *` in its
+    __init__.py) rewrites that registry for every node loaded before it. The
+    archived directory must therefore come from the class object, whose
+    `__module__` is stamped at definition and survives the hijack — trusting the
+    label shipped an archive without the classes it promised, and the lie only
+    surfaced after a full image build.
+    """
+
+    def _discover(self, env, nodes_spec):
+        packages = publisher._discover_packages(*_workflow(nodes_spec))
+        for package in packages:
+            if package.get("_archive_path"):
+                self.addCleanup(
+                    shutil.rmtree, str(Path(package["_archive_path"]).parent), ignore_errors=True
+                )
+        return packages
+
+    def test_archives_the_directory_that_defines_the_class_not_the_label(self):
+        env = _CustomNodesEnvironment(self)
+        env.package("pack_a", ["A_Node"])
+        pack_b = env.package("pack_b", ["B_Node"])
+        # A hijacked registry labeled BOTH nodes as pack_a's.
+        packages = self._discover(
+            env,
+            [
+                ("A_Node", {"cnr_id": "pack_a", "ver": "1.0.0"}),
+                ("B_Node", {"cnr_id": "pack_a", "ver": "1.0.0"}),
+            ],
+        )
+
+        by_directory = {Path(item["_package_directory"]).name: item for item in packages}
+        self.assertEqual(set(by_directory), {"pack_a", "pack_b"})
+        misattributed = by_directory["pack_b"]
+        self.assertEqual(misattributed["class_types"], ["B_Node"])
+        self.assertEqual(Path(misattributed["_package_directory"]).resolve(), pack_b.resolve())
+        self.assertRegex(misattributed["archive_sha256"], r"^[a-f0-9]{64}$")
+        # The wrong label never selects the directory and never rides along as
+        # provenance; it is recorded so hijacked registries are visible.
+        self.assertIsNone(misattributed["cnr_id"])
+        self.assertEqual(
+            misattributed["attribution_mismatches"],
+            [{"class_type": "B_Node", "labeled_cnr_id": "pack_a"}],
+        )
+        self.assertEqual(by_directory["pack_a"]["cnr_id"], "pack_a")
+        self.assertNotIn("attribution_mismatches", by_directory["pack_a"])
+
+    def test_registry_label_survives_as_provenance_when_it_agrees(self):
+        env = _CustomNodesEnvironment(self)
+        env.package("comfyui-example", ["ExampleNode"])
+        packages = self._discover(
+            env, [("ExampleNode", {"cnr_id": "comfyui-example", "ver": "1.2.3"})]
+        )
+
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0]["cnr_id"], "comfyui-example")
+        self.assertEqual(packages[0]["version"], "1.2.3")
+        self.assertEqual(packages[0]["class_types"], ["ExampleNode"])
+        self.assertRegex(packages[0]["archive_sha256"], r"^[a-f0-9]{64}$")
+        self.assertGreater(packages[0]["_archive_size"], 0)
+        self.assertNotIn("attribution_mismatches", packages[0])
+
+    def test_core_classes_are_skipped_by_resolved_location_not_by_label(self):
+        env = _CustomNodesEnvironment(self)
+        env.core_class("KSampler")
+        # Even a hijacked label on a core class packages nothing: core-ness is
+        # derived from where the class resolves, not from what the label says.
+        packages = self._discover(
+            env,
+            [
+                ("KSampler", {"cnr_id": "comfy-core", "ver": "0.3.0"}),
+            ],
+        )
+        self.assertEqual(packages, [])
+        env.core_class("CLIPTextEncode")
+        packages = self._discover(env, [("CLIPTextEncode", {"cnr_id": "pack_a"})])
+        self.assertEqual(packages, [])
+
+    def test_fails_the_publish_when_a_class_is_not_registered(self):
+        env = _CustomNodesEnvironment(self)
+        env.package("pack_a", ["A_Node"])
+        with self.assertRaises(RuntimeError) as caught:
+            self._discover(
+                env,
+                [
+                    ("A_Node", {"cnr_id": "pack_a"}),
+                    ("MissingNode", {"cnr_id": "pack_a"}),
+                ],
+            )
+        self.assertIn("MissingNode", str(caught.exception))
+        self.assertIn("not registered", str(caught.exception))
+
+    def test_fails_the_publish_when_a_class_resolves_outside_comfyui(self):
+        env = _CustomNodesEnvironment(self)
+        with tempfile.TemporaryDirectory() as elsewhere:
+            stray = Path(elsewhere) / "stray.py"
+            stray.write_text("class StrayNode:\n    pass\n", encoding="utf-8")
+            env.register_class("StrayNode", stray)
+            with self.assertRaises(RuntimeError) as caught:
+                self._discover(env, [("StrayNode", {})])
+        self.assertIn("StrayNode", str(caught.exception))
+
+
+class GitMetadataTests(unittest.TestCase):
+    """
+    `git -C` walks up until it finds A repository, not THIS package's: a
+    hand-copied folder inside a ComfyUI checkout reported ComfyUI's own URL and
+    dirty flag — provenance for the wrong code.
+    """
+
+    def _git(self, directory: Path, *args: str) -> None:
+        import subprocess
+
+        subprocess.check_output(["git", "-C", str(directory), *args], stderr=subprocess.DEVNULL)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_reports_no_repository_for_a_folder_inside_someone_elses_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "ComfyUI"
+            package = checkout / "custom_nodes" / "hand_copied_pack"
+            package.mkdir(parents=True)
+            self._git(checkout, "init", "-q")
+            self.assertEqual(
+                publisher._git_metadata(package),
+                {"git_commit": None, "repository_url": None, "dirty": True},
+            )
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_reports_the_packages_own_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "cloned_pack"
+            package.mkdir()
+            (package / "node.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+            self._git(package, "init", "-q")
+            self._git(package, "config", "user.email", "test@example.test")
+            self._git(package, "config", "user.name", "Test")
+            self._git(package, "add", "node.py")
+            self._git(package, "commit", "-q", "-m", "initial")
+            self._git(package, "remote", "add", "origin", "https://github.com/example/pack.git")
+
+            metadata = publisher._git_metadata(package)
+
+            self.assertRegex(metadata["git_commit"], r"^[a-f0-9]{40}$")
+            self.assertEqual(metadata["repository_url"], "https://github.com/example/pack.git")
+            self.assertFalse(metadata["dirty"])
 
 
 class HuggingFaceRepositoryTypeTests(unittest.TestCase):
