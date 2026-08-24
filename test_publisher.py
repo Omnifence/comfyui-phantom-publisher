@@ -195,6 +195,68 @@ class PublisherDiscoveryTests(unittest.TestCase):
             })
             self.assertEqual(len({model["sha256"] for model in models}), 1)
 
+    def test_rejects_strings_that_cannot_name_a_file(self):
+        self.assertTrue(publisher._is_plausible_filename("primary.safetensors"))
+        self.assertTrue(publisher._is_plausible_filename("sdxl/refiner.safetensors"))
+        self.assertFalse(publisher._is_plausible_filename(""))
+        self.assertFalse(publisher._is_plausible_filename("a prompt\nwith a newline"))
+        self.assertFalse(publisher._is_plausible_filename("x" * 256))
+        self.assertFalse(publisher._is_plausible_filename("/".join(["x" * 200] * 40)))
+
+    def test_resolve_model_rejects_prompt_text_before_touching_the_filesystem(self):
+        # The failure is platform-dependent — Linux raises ENAMETOOLONG from
+        # is_file(), newer macOS builds of CPython swallow it — so the contract
+        # under test is that an implausible name never reaches the filesystem
+        # at all, on any platform.
+        looked_up: list[str] = []
+        original_get_paths = publisher.folder_paths.get_folder_paths
+        publisher.folder_paths.get_folder_paths = lambda kind: looked_up.append(kind) or []
+        try:
+            self.assertIsNone(
+                publisher._resolve_model("side angle. 25 year old female, " + "x" * 600, "checkpoints")
+            )
+            self.assertEqual(looked_up, [])
+            self.assertIsNone(publisher._resolve_model("primary.safetensors", "checkpoints"))
+            self.assertEqual(looked_up, ["checkpoints"])
+        finally:
+            publisher.folder_paths.get_folder_paths = original_get_paths
+
+    def test_prompt_text_does_not_fail_discovery(self):
+        # Discovery probes every string input against every model directory, so
+        # it also sees prompts. Joining a prompt to a model root and calling
+        # is_file() raises OSError(ENAMETOOLONG) rather than returning False,
+        # which failed the whole publish at 10%.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoints = root / "models" / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            (checkpoints / "primary.safetensors").write_bytes(b"a model")
+            original_base = publisher.folder_paths.base_path
+            original_get_paths = publisher.folder_paths.get_folder_paths
+            original_names = getattr(publisher.folder_paths, "folder_names_and_paths", None)
+            publisher.folder_paths.base_path = str(root)
+            publisher.folder_paths.get_folder_paths = lambda kind: (
+                [str(checkpoints)] if kind == "checkpoints" else []
+            )
+            publisher.folder_paths.folder_names_and_paths = {"checkpoints": object()}
+            try:
+                models = publisher._discover_models(
+                    {
+                        "1": {"inputs": {"ckpt_name": "primary.safetensors"}},
+                        "2": {"inputs": {"text": "side angle. 25 year old female, " + "x" * 600}},
+                    },
+                    {},
+                )
+            finally:
+                publisher.folder_paths.base_path = original_base
+                publisher.folder_paths.get_folder_paths = original_get_paths
+                if original_names is None:
+                    del publisher.folder_paths.folder_names_and_paths
+                else:
+                    publisher.folder_paths.folder_names_and_paths = original_names
+
+            self.assertEqual([model["filename"] for model in models], ["primary.safetensors"])
+
 
 class PipDependencyCaptureTests(unittest.TestCase):
     """
