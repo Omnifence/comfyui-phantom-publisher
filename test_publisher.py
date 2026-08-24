@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 class _Routes:
@@ -24,6 +25,7 @@ class _Routes:
 def _load_publisher():
     aiohttp = types.ModuleType("aiohttp")
     aiohttp.web = types.ModuleType("aiohttp.web")
+    aiohttp.ClientTimeout = lambda **fields: types.SimpleNamespace(**fields)
     sys.modules["aiohttp"] = aiohttp
     sys.modules["aiohttp.web"] = aiohttp.web
 
@@ -381,6 +383,18 @@ class HuggingFaceDiscoveryTests(unittest.TestCase):
         )
 
 
+class ClientTimeoutTests(unittest.TestCase):
+    def test_waits_out_a_slow_answer_but_not_a_dead_socket(self):
+        # aiohttp caps every request at 5 minutes by default. Phantom hashes a
+        # whole artifact before it answers the finalize call, so that default
+        # failed a 28 GB publish after every byte had already landed.
+        timeout = publisher._client_timeout()
+        self.assertIsNone(timeout.total)
+        self.assertIsNone(timeout.connect)
+        self.assertEqual(timeout.sock_connect, 30)
+        self.assertEqual(timeout.sock_read, 15 * 60)
+
+
 class PipDependencyCaptureTests(unittest.TestCase):
     """
     A node package that imports a module it never declares in requirements.txt
@@ -632,11 +646,15 @@ class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
         progress: list[tuple[int, int, bool]] = []
         requested_paths: list[str] = []
         uploaded_chunks: list[bytes] = []
+        part_timeouts: list[Any] = []
         original_request = publisher._phantom_request
         original_session = getattr(publisher.aiohttp, "ClientSession", None)
 
-        async def request(_method, path, _config, _body=None, **_options):
+        request_options: dict[str, dict[str, Any]] = {}
+
+        async def request(_method, path, _config, _body=None, **options):
             requested_paths.append(path)
+            request_options[path] = options
             if path.endswith("/uploads"):
                 return {
                     "reused": False,
@@ -658,6 +676,9 @@ class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         class Session:
+            def __init__(self, *, timeout=None, **_options):
+                part_timeouts.append(timeout)
+
             async def __aenter__(self):
                 return self
 
@@ -697,6 +718,15 @@ class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((8, 10, False), progress)
         self.assertEqual(progress[-1], (10, 10, False))
         self.assertEqual(sum("/parts/" in path for path in requested_paths), 2)
+        # Every part PUT carries the explicit policy, not aiohttp's 5-minute
+        # default total.
+        self.assertTrue(part_timeouts)
+        self.assertTrue(all(timeout.total is None for timeout in part_timeouts))
+        self.assertTrue(all(timeout.sock_read == 15 * 60 for timeout in part_timeouts))
+        # Finalizing is free to retry: every part is already in the object
+        # store, so a repeat sends no bytes.
+        complete = next(path for path in requested_paths if path.endswith("/complete"))
+        self.assertEqual(request_options[complete]["transient_retries"], 3)
 
 
 class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
@@ -716,7 +746,7 @@ class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
                 return '{"ok": true}'
 
         class Session:
-            def __init__(self, *, headers):
+            def __init__(self, *, headers, timeout=None):
                 captured["headers"] = headers
 
             async def __aenter__(self):
@@ -773,7 +803,7 @@ class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
                 return '{"ok": true}' if self.status == 200 else '{"message": "temporary"}'
 
         class Session:
-            def __init__(self, *, headers):
+            def __init__(self, *, headers, timeout=None):
                 self.headers = headers
 
             async def __aenter__(self):
@@ -844,7 +874,7 @@ class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("must not parse the body as JSON before classifying it")
 
         class Session:
-            def __init__(self, *, headers):
+            def __init__(self, *, headers, timeout=None):
                 self.headers = headers
 
             async def __aenter__(self):
@@ -897,7 +927,7 @@ class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
                 return "Bad Request"
 
         class Session:
-            def __init__(self, *, headers):
+            def __init__(self, *, headers, timeout=None):
                 self.headers = headers
 
             async def __aenter__(self):
