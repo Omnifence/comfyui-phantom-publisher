@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.5.1"
+PUBLISHER_VERSION = "0.5.2"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -51,6 +51,32 @@ def _job_log(
     )
     if len(logs) > PUBLISH_LOG_LIMIT:
         del logs[: len(logs) - PUBLISH_LOG_LIMIT]
+
+
+def _comfyui_core_version():
+    """
+    The ComfyUI core release this machine runs, or None when it cannot be read.
+
+    ComfyUI publishes its version as `comfyui_version.__version__` — a
+    generated module at the repo root — NOT as `comfy.__version__`. The `comfy`
+    package has no `__init__.py` at all, so the previous `getattr(comfy,
+    "__version__", None)` returned None on every publish that has ever run.
+
+    That silence is not cosmetic. Phantom compares this against the ComfyUI core
+    its base images bundle, to decide whether a build has to install a newer
+    core than the image froze. With None it cannot decide, so it ships the
+    image's own core — and a graph that uses a node input a newer core added
+    then builds clean, deploys clean, and fails inside ComfyUI's validation on
+    the caller's job.
+    """
+    try:
+        import comfyui_version
+    except Exception:
+        return None
+    version = getattr(comfyui_version, "__version__", None)
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    return None
 
 
 def _log_server_warnings(job: dict[str, Any], version: Any) -> None:
@@ -1136,7 +1162,7 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
             "schema_version": 1,
             "idempotency_key": body.get("idempotency_key") or str(uuid.uuid4()),
             "comfyui": {
-                "core_version": getattr(__import__("comfy"), "__version__", None),
+                "core_version": _comfyui_core_version(),
                 "frontend_version": None,
                 "publisher_version": PUBLISHER_VERSION,
             },
