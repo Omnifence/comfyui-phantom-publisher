@@ -783,6 +783,57 @@ class ServerWarningTests(unittest.TestCase):
         self.assertEqual(job["logs"], [])
 
 
+class ComfyuiCoreVersionTests(unittest.TestCase):
+    """
+    Phantom decides whether a build must install a newer ComfyUI core than its
+    base image froze by comparing this value. Reading it off the wrong module
+    reported None on every publish, so that decision could never be made and a
+    graph authored on a newer core shipped against an older one.
+    """
+
+    def setUp(self):
+        self._saved = sys.modules.get("comfyui_version")
+
+    def tearDown(self):
+        if self._saved is None:
+            sys.modules.pop("comfyui_version", None)
+        else:
+            sys.modules["comfyui_version"] = self._saved
+
+    def test_reads_the_generated_comfyui_version_module(self):
+        module = types.ModuleType("comfyui_version")
+        module.__version__ = "0.26.0"
+        sys.modules["comfyui_version"] = module
+        self.assertEqual(publisher._comfyui_core_version(), "0.26.0")
+
+    def test_returns_none_when_the_module_is_absent(self):
+        sys.modules.pop("comfyui_version", None)
+        # Nothing on sys.path provides it in the test environment, so the import
+        # fails exactly as it would outside a ComfyUI checkout.
+        self.assertIsNone(publisher._comfyui_core_version())
+
+    def test_treats_a_blank_or_non_string_version_as_unknown(self):
+        for value in ("", "   ", None, 26):
+            module = types.ModuleType("comfyui_version")
+            module.__version__ = value
+            sys.modules["comfyui_version"] = module
+            self.assertIsNone(publisher._comfyui_core_version())
+
+    def test_does_not_read_it_off_the_comfy_package(self):
+        # The old source. `comfy` has no __init__.py, so even a stub carrying
+        # __version__ must not be what this returns.
+        comfy = types.ModuleType("comfy")
+        comfy.__version__ = "wrong-source"
+        sys.modules["comfy"] = comfy
+        try:
+            module = types.ModuleType("comfyui_version")
+            module.__version__ = "0.26.0"
+            sys.modules["comfyui_version"] = module
+            self.assertEqual(publisher._comfyui_core_version(), "0.26.0")
+        finally:
+            sys.modules.pop("comfy", None)
+
+
 class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
     def test_publish_log_records_context_and_keeps_a_bounded_tail(self):
         job = {"status": "uploading", "logs": []}
