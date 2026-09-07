@@ -95,8 +95,13 @@ Every code change ships with tests.
   `<user directory>/.phantom-publisher.json` at mode `0600`, created restricted
   rather than chmod-ed after the fact, and it must never reach workflow JSON, a
   log line or an error message.
-- A published workflow carries only `origin`, `workflow_id` and, for an
-  variation graph, its `variation` label under top-level `extra.phantom`.
+- A published workflow carries only `origin`, `workflow_id` and, for a
+  variation graph, its `variation` block — the label, the optional description,
+  and the `variation_id` Phantom assigned — under top-level `extra.phantom`.
+  The id is what lets the next publish update that graph instead of adding a
+  second variation beside it, so the panel writes it back when a publish
+  completes. A graph saved by 0.6.0 carries the same block under the old
+  `alternative` key; it is read as a fallback and rewritten in the new shape.
 
 ## The Phantom API contract
 

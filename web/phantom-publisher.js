@@ -161,6 +161,21 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
     const id = updatedVariationId(publishAs.value);
     return id ? (target?.variations || []).find((v) => v.variation_id === id) || null : null;
   };
+  // The variation the remembered block names, by id and then by label. The
+  // label fallback is what a graph published before the id came back carries —
+  // a 0.6.0 graph, or one whose panel was closed before the publish finished —
+  // and matching it is what stops the next publish adding a duplicate.
+  const rememberedMatch = (target) => {
+    const variations = target?.variations || [];
+    if (!rememberedVariation) return null;
+    return (
+      (rememberedVariation.variation_id &&
+        variations.find((v) => v.variation_id === rememberedVariation.variation_id)) ||
+      (rememberedVariation.label &&
+        variations.find((v) => v.label === rememberedVariation.label)) ||
+      null
+    );
+  };
   // Rebuilt per target: each workflow has its own variations. The remembered
   // choice is kept when the target still offers it — an update of a variation
   // that has since been removed falls back to publishing a new one under the
@@ -168,13 +183,12 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
   const rebuildPublishAs = () => {
     const target = data.targets.find((candidate) => candidate.workflow_id === select.value);
     publishAs.replaceChildren(...publishAsOptions(target));
-    const rememberedUpdate =
-      rememberedVariation?.variation_id &&
-      (target?.variations || []).some((v) => v.variation_id === rememberedVariation.variation_id)
-        ? updateVariationValue(rememberedVariation.variation_id)
-        : null;
-    publishAs.value =
-      rememberedUpdate || (rememberedVariation ? PUBLISH_AS_VARIATION : PUBLISH_AS_VERSION);
+    const matched = rememberedMatch(target);
+    publishAs.value = matched
+      ? updateVariationValue(matched.variation_id)
+      : rememberedVariation
+        ? PUBLISH_AS_VARIATION
+        : PUBLISH_AS_VERSION;
     prefillVariationFields();
   };
   // An update starts from the variation's own label and description; a new
@@ -524,7 +538,7 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
       logDetails.open = true;
       logList.scrollTop = logList.scrollHeight;
       finish();
-      return;
+      return job;
     }
     if (job.status === 'cancelled') {
       // The idempotency key stays: a retry of this exact payload resumes the
@@ -536,7 +550,7 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
       logDetails.open = true;
       logList.scrollTop = logList.scrollHeight;
       finish();
-      return;
+      return job;
     }
     if (job.status === 'completed') {
       localStorage.removeItem(idempotencyStorageKey);
@@ -552,10 +566,13 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
         );
       modal.panel.append(open);
       finish();
-      return;
+      return job;
     }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+  // The panel was closed. The publish carries on in the ComfyUI server, and
+  // nothing here learns how it ended.
+  return null;
 };
 
 const publish = async () => {
@@ -567,7 +584,12 @@ const publish = async () => {
     }
     const graphExtra = app.graph.extra || (app.graph.extra = {});
     const phantom = graphExtra.phantom || {};
-    const target = await chooseTarget(phantom.workflow_id, config, phantom.variation || null);
+    // 0.6.0 wrote the block as `alternative`, so a graph saved by that version
+    // is read here and written back below in the `variation` shape. Without the
+    // fallback the dialog would open such a graph on the primary and the next
+    // publish would replace the primary graph instead of the variation.
+    const rememberedVariation = phantom.variation || phantom.alternative || null;
+    const target = await chooseTarget(phantom.workflow_id, config, rememberedVariation);
     if (target === RECONFIGURE) {
       // The target list belongs to the old Phantom, so re-enter from the top
       // rather than reusing anything read before the switch. A dismissed
@@ -606,7 +628,18 @@ const publish = async () => {
         idempotency_key: idempotencyKey,
       }),
     });
-    await showProgress(job.job_id, config.console_origin, target.slug, idempotencyStorageKey);
+    const finished = await showProgress(
+      job.job_id,
+      config.console_origin,
+      target.slug,
+      idempotencyStorageKey,
+    );
+    // Phantom assigns the variation id, and a new variation only learns its own
+    // here. Written back so the next publish of this file updates that graph
+    // instead of adding another variation beside it.
+    if (finished?.variation?.variation_id && graphExtra.phantom.variation) {
+      graphExtra.phantom.variation = { ...graphExtra.phantom.variation, ...finished.variation };
+    }
   } catch (error) {
     const modal = dialog();
     modal.panel.innerHTML = `<h2>Publish failed</h2><p class="phantom-publisher-error"></p>`;

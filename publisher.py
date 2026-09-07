@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import gzip
 import hashlib
 import importlib.metadata
@@ -13,11 +14,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import aiohttp
 from aiohttp import web
@@ -34,6 +36,23 @@ _jobs: dict[str, dict[str, Any]] = {}
 # panel polls, and a Task is not JSON. Cancelling a publish is cancelling this.
 _job_tasks: dict[str, "asyncio.Task[None]"] = {}
 PUBLISH_LOG_LIMIT = 200
+
+
+class _DiscoveryCancelled(Exception):
+    """Raised inside a discovery worker once the author has cancelled."""
+
+
+def _stop_if_cancelled(cancellation: threading.Event | None) -> None:
+    """
+    Cooperative cancellation for the discovery threads.
+
+    `asyncio.to_thread` cannot interrupt a worker: cancelling the task ends the
+    await, not the thread. Hashing a model set, archiving packages and
+    downloading Hugging Face snapshots each take minutes, so every discovery
+    loop calls this between items and stops there.
+    """
+    if cancellation is not None and cancellation.is_set():
+        raise _DiscoveryCancelled("The publish was cancelled during discovery")
 
 
 def _job_log(
@@ -288,7 +307,11 @@ def _resolve_model(filename: str, model_type: str) -> tuple[Path, str] | None:
     return None
 
 
-def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) -> list[dict[str, Any]]:
+def _discover_models(
+    api_workflow: dict[str, Any],
+    ui_workflow: dict[str, Any],
+    cancellation: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     ui_nodes = _node_properties(ui_workflow)
     # The destination path is part of the workflow contract. Two filenames may
     # intentionally contain the same bytes (aliases, hard links, or copied
@@ -296,6 +319,7 @@ def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) 
     # image even though its node still references it.
     discovered: dict[tuple[str, str], dict[str, Any]] = {}
     for node_id, raw_node in api_workflow.items():
+        _stop_if_cancelled(cancellation)
         if not isinstance(raw_node, dict):
             continue
         ui_node = ui_nodes.get(str(node_id), {})
@@ -321,6 +345,9 @@ def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) 
                         candidates.append((value, model_type, []))
                         break
         for filename, model_type, urls in candidates:
+            # Reading a multi-gigabyte checkpoint to hash it is the slowest step
+            # in discovery, so the flag is checked before each one.
+            _stop_if_cancelled(cancellation)
             resolved = _resolve_model(filename, model_type)
             if not resolved:
                 continue
@@ -608,6 +635,7 @@ def _discover_huggingface_models(
     packages: list[dict[str, Any]],
     on_repository: Callable[[str, int, int], None] | None = None,
     on_skipped: Callable[[str, str], None] | None = None,
+    cancellation: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     discovered: list[dict[str, Any]] = []
     repo_ids: set[str] = set()
@@ -617,6 +645,7 @@ def _discover_huggingface_models(
     try:
         sorted_repo_ids = sorted(repo_ids)
         for index, repo_id in enumerate(sorted_repo_ids):
+            _stop_if_cancelled(cancellation)
             if on_repository:
                 on_repository(repo_id, index, len(sorted_repo_ids))
             repo_type = _huggingface_repo_type(repo_id)
@@ -645,7 +674,7 @@ def _discover_huggingface_models(
                     "_local_path": str(archive),
                 }
             )
-    except Exception:
+    except BaseException:
         for item in discovered:
             shutil.rmtree(Path(item["_local_path"]).parent, ignore_errors=True)
         raise
@@ -668,7 +697,11 @@ def _class_source_file(nodes_module: Any, class_type: str) -> tuple[Path | None,
     return (Path(module_file).resolve() if module_file else None), module_name
 
 
-def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) -> list[dict[str, Any]]:
+def _discover_packages(
+    api_workflow: dict[str, Any],
+    ui_workflow: dict[str, Any],
+    cancellation: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     import nodes
 
     # The archived directory always comes from the CLASS OBJECT, never from the
@@ -687,6 +720,7 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
 
     grouped: dict[str, dict[str, Any]] = {}
     for node_id, raw_node in api_workflow.items():
+        _stop_if_cancelled(cancellation)
         if not isinstance(raw_node, dict) or not isinstance(raw_node.get("class_type"), str):
             continue
         class_type = raw_node["class_type"]
@@ -735,7 +769,30 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
                 entry["mismatches"].append({"class_type": class_type, "labeled_cnr_id": cnr_id})
 
     result: list[dict[str, Any]] = []
+    try:
+        result.extend(_archive_grouped_packages(grouped, cancellation))
+    except BaseException:
+        # Whatever was archived belongs to a publish that will not happen, and
+        # only this frame knows where those archives are — the caller registers
+        # them for deletion off the RETURNED list, which a raise never produces.
+        for item in result:
+            shutil.rmtree(Path(item["_archive_path"]).parent, ignore_errors=True)
+        raise
+    return result
+
+
+def _archive_grouped_packages(
+    grouped: dict[str, dict[str, Any]],
+    cancellation: threading.Event | None,
+) -> Iterator[dict[str, Any]]:
+    """
+    Archive one package per resolved directory, yielding each as it lands.
+
+    A generator so a cancelled or failed run still hands its caller everything
+    written up to that point, which is what has to be deleted.
+    """
     for directory_key in sorted(grouped):
+        _stop_if_cancelled(cancellation)
         entry = grouped[directory_key]
         directory = Path(directory_key)
         # Registry coordinates stay as PROVENANCE when the label agrees with the
@@ -769,8 +826,7 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
                 "_archive_size": size,
             }
         )
-        result.append(package)
-    return result
+        yield package
 
 
 def _parse_json_body(raw: str) -> Any | None:
@@ -1147,6 +1203,18 @@ def _versions_request_body(
     }
 
 
+def _package_archives(packages: list[dict[str, Any]]) -> list[Path]:
+    """The temporary archive written for each discovered node package."""
+    return [Path(item["_archive_path"]) for item in packages if item.get("_archive_path")]
+
+
+def _external_model_archives(models: list[dict[str, Any]]) -> list[Path]:
+    """The temporary archive written for each snapshotted external model."""
+    return [
+        Path(item["_local_path"]) for item in models if item.get("archive_format") == "tar.gz"
+    ]
+
+
 async def _run_publish(
     job_id: str,
     body: dict[str, Any],
@@ -1154,6 +1222,48 @@ async def _run_publish(
 ) -> None:
     job = _jobs[job_id]
     temporary_archives: list[Path] = []
+    # Set when the author cancels, and read by the discovery workers between
+    # items. Cancelling the task cannot stop a thread; this is what does.
+    cancellation = threading.Event()
+    # The connection this publish belongs to, read once. Cancellation cleanup
+    # uses THIS one: another tab can point the config at a different Phantom
+    # mid-publish, and the staged version only exists in the one that made it.
+    config: dict[str, Any] = {}
+
+    async def discover(
+        function: Callable[..., Any],
+        *args: Any,
+        archives: Callable[[Any], list[Path]] = lambda _result: [],
+    ) -> Any:
+        """
+        Run one blocking discovery call, and never leave its worker behind.
+
+        A cancelled `to_thread` await ends the await, not the thread: the job
+        would report itself cancelled while models were still being hashed and
+        archives still being written, and those archives — registered only once
+        the call returns — would never be deleted. The worker is reaped here
+        instead, and whatever it produced is registered before the cancellation
+        travels on.
+        """
+        worker = asyncio.ensure_future(asyncio.to_thread(function, *args, cancellation))
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.set()
+            _job_step(
+                job,
+                "Cancelling — waiting for the workflow inspection to stop…",
+                status="cancelling",
+            )
+            reaped: Any = None
+            with contextlib.suppress(BaseException):
+                reaped = await worker
+            if reaped is not None:
+                temporary_archives.extend(archives(reaped))
+            raise
+        temporary_archives.extend(archives(result))
+        return result
+
     try:
         config = _read_config()
         _job_step(
@@ -1164,13 +1274,13 @@ async def _run_publish(
         )
         api_workflow = body["api_workflow"]
         ui_workflow = body["ui_workflow"]
-        models = await asyncio.to_thread(_discover_models, api_workflow, ui_workflow)
-        packages = await asyncio.to_thread(_discover_packages, api_workflow, ui_workflow)
-        temporary_archives = [
-            Path(item["_archive_path"])
-            for item in packages
-            if item.get("_archive_path")
-        ]
+        models = await discover(_discover_models, api_workflow, ui_workflow)
+        packages = await discover(
+            _discover_packages,
+            api_workflow,
+            ui_workflow,
+            archives=_package_archives,
+        )
 
         def report_external_repository(repo_id: str, index: int, total: int) -> None:
             _job_step(
@@ -1189,17 +1299,13 @@ async def _run_publish(
             status="snapshotting_external_models",
             progress=20,
         )
-        models += await asyncio.to_thread(
+        models += await discover(
             _discover_huggingface_models,
             packages,
             report_external_repository,
             report_skipped_repository,
+            archives=_external_model_archives,
         )
-        temporary_archives += [
-            Path(item["_local_path"])
-            for item in models
-            if item.get("archive_format") == "tar.gz"
-        ]
         dependencies, uploads = _dependency_progress(models, packages)
         total_upload_bytes = sum(size for _, _, size, _ in uploads)
         job.update(
@@ -1246,6 +1352,14 @@ async def _run_publish(
         version_id = version["workflow_version_id"]
         job["version_id"] = version_id
         staged = version.get("variation") if isinstance(version, dict) else None
+        if isinstance(staged, dict) and staged.get("variation_id"):
+            # The id Phantom assigned. The panel writes it back into the graph,
+            # so the next publish of this file offers "update this variation"
+            # rather than adding a second one under the same label.
+            job["variation"] = {
+                "variation_id": staged["variation_id"],
+                **({"label": staged["label"]} if staged.get("label") else {}),
+            }
         if isinstance(staged, dict) and staged.get("label"):
             if variation and variation.get("variation_id"):
                 _job_log(
@@ -1348,7 +1462,7 @@ async def _run_publish(
         # this is the one place the transfer actually stops. The parts already
         # written are abandoned on Phantom too; a publish nobody is driving
         # must not leave a half-uploaded artifact behind.
-        await _abandon_uploads(job)
+        await _abandon_uploads(job, config)
         job.update(status="cancelled", message="Publish cancelled", error=None)
         _job_log(job, "Publish cancelled.")
     except Exception as error:  # surfaced verbatim only to the local authenticated browser session
@@ -1363,9 +1477,14 @@ async def _run_publish(
             shutil.rmtree(archive.parent, ignore_errors=True)
 
 
-async def _abandon_uploads(job: dict[str, Any]) -> None:
+async def _abandon_uploads(job: dict[str, Any], config: dict[str, Any]) -> None:
     """
     Tell Phantom to abort every multipart upload this job had in flight.
+
+    `config` is the connection the publish itself used. Re-reading the file
+    here would address whatever Phantom the config names NOW — another tab can
+    change it mid-publish — sending a DELETE for a version that only exists in
+    the old one, against an id that may name something else in the new one.
 
     Best effort: the job is already cancelled whatever Phantom answers, and a
     cancel must not hang on a server that is the reason the author cancelled.
@@ -1376,21 +1495,26 @@ async def _abandon_uploads(job: dict[str, Any]) -> None:
             continue
         dependency.update(status="cancelled")
         digest = dependency.get("sha256")
-        if not version_id or not digest:
+        if not version_id or not digest or not config.get("token"):
             continue
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(
-                    _phantom_request(
-                        "DELETE",
-                        f"/versions/{version_id}/artifacts/{digest}/uploads",
-                        _read_config(),
-                    )
-                ),
-                timeout=_ABANDON_TIMEOUT_SECONDS,
+        # Awaited as a task, unshielded: a shielded `wait_for` cancels only the
+        # wrapper, so the DELETE stayed in flight for its full 60s connect
+        # timeout and could land AFTER a retry resumed the same staged version
+        # — aborting that retry's upload instead of this one's.
+        abandon = asyncio.ensure_future(
+            _phantom_request(
+                "DELETE",
+                f"/versions/{version_id}/artifacts/{digest}/uploads",
+                config,
             )
+        )
+        try:
+            await asyncio.wait_for(abandon, timeout=_ABANDON_TIMEOUT_SECONDS)
             _job_log(job, f"Abandoned the upload of {dependency.get('name', digest)}.")
         except BaseException as error:  # noqa: BLE001 — cancellation must finish
+            abandon.cancel()
+            with contextlib.suppress(BaseException):
+                await abandon
             _job_log(
                 job,
                 f"Could not abandon the upload of {dependency.get('name', digest)}: "

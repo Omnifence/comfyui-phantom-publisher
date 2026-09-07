@@ -36,9 +36,9 @@ describe('Phantom publisher progress UI', () => {
     contains(js, 'dependencies processed');
     contains(js, 'Publish activity log');
     contains(js, 'updateLogRows(job.logs)');
-    contains(
+    matches(
       js,
-      'showProgress(job.job_id, config.console_origin, target.slug, idempotencyStorageKey)',
+      /showProgress\(\s*job\.job_id,\s*config\.console_origin,\s*target\.slug,\s*idempotencyStorageKey,\s*\)/,
     );
     contains(js, 'Phantom console origin');
     matches(js, /job\.status === 'failed'[\s\S]*?logDetails\.open = true/);
@@ -63,14 +63,17 @@ describe('Phantom publisher cancel', () => {
   it('shows the cancelled state, stops polling, and offers Close', () => {
     matches(
       js,
-      /job\.status === 'cancelled'[\s\S]*?phase\.textContent = 'Publish cancelled'[\s\S]*?finish\(\);\s*return;/,
+      /job\.status === 'cancelled'[\s\S]*?phase\.textContent = 'Publish cancelled'[\s\S]*?finish\(\);\s*return job;/,
     );
     contains(js, "cancelled: 'Cancelled'");
     contains(css, "[data-status='cancelled']");
-    // Every terminal state removes Cancel and offers Close.
-    matches(js, /job\.status === 'failed'[\s\S]*?finish\(\);\s*return;/);
-    matches(js, /job\.status === 'completed'[\s\S]*?finish\(\);\s*return;/);
+    // Every terminal state removes Cancel, offers Close, and hands the finished
+    // job back — the caller reads the variation Phantom assigned off it.
+    matches(js, /job\.status === 'failed'[\s\S]*?finish\(\);\s*return job;/);
+    matches(js, /job\.status === 'completed'[\s\S]*?finish\(\);\s*return job;/);
     matches(js, /const finish = \(\) => \{\s*cancel\.remove\(\);/);
+    // A closed panel learns nothing; the publish carries on in the server.
+    contains(js, 'return null;');
   });
 });
 
@@ -171,13 +174,42 @@ describe('Phantom publisher variation graphs', () => {
   });
 
   it('reopens on the remembered variation only while the target still has it', () => {
+    contains(js, 'const matched = rememberedMatch(target);');
     matches(
       js,
-      /rememberedVariation\?\.variation_id &&\s*\(target\?\.variations \|\| \[\]\)\.some\(\(v\) => v\.variation_id === rememberedVariation\.variation_id\)/,
+      /publishAs\.value = matched\s*\? updateVariationValue\(matched\.variation_id\)\s*: rememberedVariation\s*\? PUBLISH_AS_VARIATION\s*: PUBLISH_AS_VERSION;/,
     );
+  });
+
+  it('matches the remembered variation by id, and falls back to its label', () => {
+    // A graph carries no id when it was published by 0.6.0, or when the panel
+    // was closed before the publish finished. Matching the label is what stops
+    // the next publish adding a duplicate of a variation that already exists.
+    matches(
+      js,
+      /rememberedVariation\.variation_id &&\s*variations\.find\(\(v\) => v\.variation_id === rememberedVariation\.variation_id\)/,
+    );
+    matches(
+      js,
+      /rememberedVariation\.label &&\s*variations\.find\(\(v\) => v\.label === rememberedVariation\.label\)/,
+    );
+  });
+
+  it('reads the block 0.6.0 wrote and republishes it in the variation shape', () => {
+    // 0.6.0 called it `alternative`. Without the fallback the dialog opens such
+    // a graph on the primary, so the next publish replaces the primary graph.
+    contains(js, 'phantom.variation || phantom.alternative || null');
+    contains(js, 'chooseTarget(phantom.workflow_id, config, rememberedVariation)');
+  });
+
+  it('writes the variation id Phantom assigned back into the graph', () => {
+    // A new variation only learns its id from the publish that created it.
+    // Without writing it back, the next publish of the same file cannot match
+    // the graph to that variation and adds a second one instead.
+    contains(js, 'finished?.variation?.variation_id && graphExtra.phantom.variation');
     contains(
       js,
-      'rememberedUpdate || (rememberedVariation ? PUBLISH_AS_VARIATION : PUBLISH_AS_VERSION)',
+      'graphExtra.phantom.variation = { ...graphExtra.phantom.variation, ...finished.variation };',
     );
   });
 
@@ -191,7 +223,6 @@ describe('Phantom publisher variation graphs', () => {
   });
 
   it('remembers the label in the graph so a republish opens on it, and never sends a dead mapping', () => {
-    contains(js, 'chooseTarget(phantom.workflow_id, config, phantom.variation || null)');
     contains(js, "rememberedVariation?.label || ''");
     // `graphExtra.phantom` is overwritten just before the prompt is read, so a
     // mapping read off it was always undefined. Nothing reads it now.

@@ -6,6 +6,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -1690,7 +1692,7 @@ class CancelPublishTests(unittest.IsolatedAsyncioTestCase):
                 started.set()
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
-                await publisher._abandon_uploads(job)
+                await publisher._abandon_uploads(job, {"origin": "https://phantom.test", "token": "t"})
                 job.update(status="cancelled", message="Publish cancelled", error=None)
             finally:
                 publisher._job_tasks.pop("job-cancel", None)
@@ -1736,16 +1738,286 @@ class CancelPublishTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("Phantom unreachable")
 
         original_request = publisher._phantom_request
-        original_config = publisher._read_config
         publisher._phantom_request = failing_request
-        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
         try:
-            await publisher._abandon_uploads(job)
+            await publisher._abandon_uploads(job, {"origin": "https://phantom.test", "token": "t"})
+        finally:
+            publisher._phantom_request = original_request
+        self.assertEqual(job["dependencies"][0]["status"], "cancelled")
+        self.assertTrue(any(entry["level"] == "warning" for entry in job["logs"]))
+
+    async def test_abandon_addresses_the_phantom_the_publish_started_against(self):
+        """
+        Another tab can repoint the connection mid-publish. The staged version
+        exists only in the Phantom that made it, and the same id in the new one
+        names something else — so the DELETE must carry the captured config.
+        """
+        job = self._job(
+            "job-switched",
+            version_id="version-9",
+            dependencies=[{"id": "model-0", "name": "big", "status": "uploading", "sha256": "ab" * 32}],
+        )
+        used: list[dict[str, Any]] = []
+
+        async def fake_request(_method, _path, config, *_args, **_kwargs):
+            used.append(config)
+            return {"aborted": True}
+
+        def refuse_config():
+            raise AssertionError("cancellation must not re-read the connection")
+
+        original_request = publisher._phantom_request
+        original_config = publisher._read_config
+        publisher._phantom_request = fake_request
+        publisher._read_config = refuse_config
+        started_with = {"origin": "https://old.phantom.test", "token": "old"}
+        try:
+            await publisher._abandon_uploads(job, started_with)
         finally:
             publisher._phantom_request = original_request
             publisher._read_config = original_config
+        self.assertEqual(used, [started_with])
+
+    async def test_a_hanging_abandon_is_stopped_at_the_timeout(self):
+        """
+        A shielded `wait_for` cancelled only the wrapper, leaving the DELETE in
+        flight for its full connect timeout. It could then land after a retry
+        had resumed the same staged version, and abort THAT upload instead.
+        """
+        job = self._job(
+            "job-hanging",
+            version_id="version-9",
+            dependencies=[{"id": "model-0", "name": "big", "status": "uploading", "sha256": "ab" * 32}],
+        )
+        stopped = asyncio.Event()
+
+        async def hanging_request(*_args, **_kwargs):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                stopped.set()
+                raise
+
+        original_request = publisher._phantom_request
+        original_timeout = publisher._ABANDON_TIMEOUT_SECONDS
+        publisher._phantom_request = hanging_request
+        publisher._ABANDON_TIMEOUT_SECONDS = 0.01
+        try:
+            await publisher._abandon_uploads(job, {"origin": "https://phantom.test", "token": "t"})
+        finally:
+            publisher._phantom_request = original_request
+            publisher._ABANDON_TIMEOUT_SECONDS = original_timeout
+        self.assertTrue(stopped.is_set())
         self.assertEqual(job["dependencies"][0]["status"], "cancelled")
         self.assertTrue(any(entry["level"] == "warning" for entry in job["logs"]))
+
+    async def test_a_job_that_never_connected_sends_no_delete(self):
+        job = self._job(
+            "job-unconnected",
+            version_id="version-9",
+            dependencies=[{"id": "model-0", "name": "big", "status": "uploading", "sha256": "ab" * 32}],
+        )
+
+        async def fake_request(*_args, **_kwargs):
+            raise AssertionError("a job with no connection must send nothing")
+
+        original_request = publisher._phantom_request
+        publisher._phantom_request = fake_request
+        try:
+            await publisher._abandon_uploads(job, {})
+        finally:
+            publisher._phantom_request = original_request
+        self.assertEqual(job["dependencies"][0]["status"], "cancelled")
+
+
+class DiscoveryCancellationTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Cancelling the publish task ends the await, not the worker thread. Model
+    hashing, package archiving and Hugging Face downloads all run in one, so a
+    cancel that only stopped the await left them running — and the archives
+    they wrote, registered only once the call returned, were never deleted.
+    """
+
+    def test_model_discovery_stops_once_the_publish_is_cancelled(self):
+        cancellation = threading.Event()
+        cancellation.set()
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._discover_models({"1": {"inputs": {}}}, {"nodes": []}, cancellation)
+
+    def test_a_cancelled_package_scan_deletes_the_archives_it_already_wrote(self):
+        env = _CustomNodesEnvironment(self)
+        env.package("pack_a", ["A_Node"])
+        env.package("pack_b", ["B_Node"])
+        cancellation = threading.Event()
+        original_archive = publisher._archive_package
+        written: list[Path] = []
+
+        def archive_then_cancel(directory: Path):
+            archive, digest, size = original_archive(directory)
+            written.append(archive)
+            # The author pressed Cancel while the next package was still queued.
+            cancellation.set()
+            return archive, digest, size
+
+        publisher._archive_package = archive_then_cancel
+        self.addCleanup(setattr, publisher, "_archive_package", original_archive)
+        api, ui = _workflow([("A_Node", {}), ("B_Node", {})])
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._discover_packages(api, ui, cancellation)
+        # Only this frame ever knew where that archive was: the caller registers
+        # archives off the returned list, and a raise returns no list.
+        self.assertEqual(len(written), 1)
+        self.assertFalse(written[0].parent.exists())
+
+    async def test_cancel_reaps_the_discovery_worker_and_deletes_what_it_wrote(self):
+        job_id = "job-discovering"
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Waiting to start…",
+            "dependencies": [],
+            "logs": [],
+        }
+        publisher._jobs[job_id] = job
+        self.addCleanup(publisher._jobs.pop, job_id, None)
+        archive_root = Path(tempfile.mkdtemp(prefix="phantom-publisher-test-"))
+        self.addCleanup(shutil.rmtree, str(archive_root), True)
+        archive = archive_root / "pack_a.tar.gz"
+        archive.write_bytes(b"archived")
+        entered = threading.Event()
+        reaped = threading.Event()
+
+        def slow_packages(_api, _ui, cancellation=None):
+            entered.set()
+            while cancellation is None or not cancellation.is_set():
+                time.sleep(0.01)
+            # The worker had already written this archive when it noticed.
+            reaped.set()
+            return [{"_archive_path": str(archive)}]
+
+        originals = {
+            "_read_config": publisher._read_config,
+            "_discover_models": publisher._discover_models,
+            "_discover_packages": publisher._discover_packages,
+        }
+        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
+        publisher._discover_models = lambda *_args: []
+        publisher._discover_packages = slow_packages
+        try:
+            task = asyncio.ensure_future(publisher._run_publish(job_id, _PUBLISH_BODY))
+            publisher._job_tasks[job_id] = task
+            self.addCleanup(publisher._job_tasks.pop, job_id, None)
+            await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            # `_run_publish` handles the cancellation itself, so the task ends
+            # normally — exactly as the DELETE route awaits it.
+            await task
+        finally:
+            for name, value in originals.items():
+                setattr(publisher, name, value)
+        # The worker ran to completion rather than being abandoned mid-archive,
+        # and what it produced was deleted before the job reported a state.
+        self.assertTrue(reaped.is_set())
+        self.assertEqual(job["status"], "cancelled")
+        self.assertFalse(archive_root.exists())
+
+
+class StagedVariationTests(unittest.IsolatedAsyncioTestCase):
+    """
+    A new variation learns its id from the publish that created it. The panel
+    writes that id into the graph, so the next publish updates that variation
+    instead of adding a second one under the same label.
+    """
+
+    async def test_the_job_reports_the_variation_id_phantom_assigned(self):
+        job_id = "job-staged"
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Waiting to start…",
+            "dependencies": [],
+            "logs": [],
+        }
+        publisher._jobs[job_id] = job
+        self.addCleanup(publisher._jobs.pop, job_id, None)
+
+        async def fake_request(_method, path, _config, *_args, **_kwargs):
+            version = {"workflow_version_id": "version-3", "version": 3}
+            if path == "/versions":
+                return {
+                    **version,
+                    "variation": {"variation_id": "variation-7", "label": "Reference image"},
+                }
+            return version
+
+        originals = {
+            "_read_config": publisher._read_config,
+            "_discover_models": publisher._discover_models,
+            "_discover_packages": publisher._discover_packages,
+            "_discover_huggingface_models": publisher._discover_huggingface_models,
+            "_phantom_request": publisher._phantom_request,
+        }
+        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
+        publisher._discover_models = lambda *_args: []
+        publisher._discover_packages = lambda *_args: []
+        publisher._discover_huggingface_models = lambda *_args: []
+        publisher._phantom_request = fake_request
+        try:
+            await publisher._run_publish(
+                job_id, _PUBLISH_BODY, {"label": "Reference image"}
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(publisher, name, value)
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(
+            job["variation"], {"variation_id": "variation-7", "label": "Reference image"}
+        )
+
+    async def test_a_primary_publish_reports_no_variation(self):
+        job_id = "job-primary"
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Waiting to start…",
+            "dependencies": [],
+            "logs": [],
+        }
+        publisher._jobs[job_id] = job
+        self.addCleanup(publisher._jobs.pop, job_id, None)
+
+        async def fake_request(_method, _path, _config, *_args, **_kwargs):
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        originals = {
+            "_read_config": publisher._read_config,
+            "_discover_models": publisher._discover_models,
+            "_discover_packages": publisher._discover_packages,
+            "_discover_huggingface_models": publisher._discover_huggingface_models,
+            "_phantom_request": publisher._phantom_request,
+        }
+        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
+        publisher._discover_models = lambda *_args: []
+        publisher._discover_packages = lambda *_args: []
+        publisher._discover_huggingface_models = lambda *_args: []
+        publisher._phantom_request = fake_request
+        try:
+            await publisher._run_publish(job_id, _PUBLISH_BODY)
+        finally:
+            for name, value in originals.items():
+                setattr(publisher, name, value)
+        self.assertEqual(job["status"], "completed")
+        self.assertNotIn("variation", job)
+
+
+_PUBLISH_BODY: dict[str, Any] = {
+    "workflow_id": "wf-1",
+    "api_workflow": {},
+    "ui_workflow": {"nodes": []},
+}
 
 
 class _StubMatchRequest:
