@@ -12,14 +12,30 @@ from typing import Any
 
 
 class _Routes:
-    def get(self, _path: str):
-        return lambda handler: handler
+    """
+    `register_routes` registers through this, so it doubles as the way a test
+    reaches a route handler: the decorator records it under its method and path
+    and hands it back unchanged.
+    """
 
-    def put(self, _path: str):
-        return lambda handler: handler
+    def __init__(self) -> None:
+        self.handlers: dict[tuple[str, str], Any] = {}
 
-    def post(self, _path: str):
-        return lambda handler: handler
+    def _record(self, method: str, path: str):
+        def decorate(handler):
+            self.handlers[(method, path)] = handler
+            return handler
+
+        return decorate
+
+    def get(self, path: str):
+        return self._record("GET", path)
+
+    def put(self, path: str):
+        return self._record("PUT", path)
+
+    def post(self, path: str):
+        return self._record("POST", path)
 
 
 def _load_publisher():
@@ -54,6 +70,20 @@ def _load_publisher():
     folder_paths.base_path = tempfile.gettempdir()
     folder_paths.get_folder_paths = lambda _kind: []
     sys.modules["folder_paths"] = folder_paths
+
+    class HTTPBadRequest(Exception):
+        def __init__(self, *, text: str = "") -> None:
+            super().__init__(text)
+            self.text = text
+
+    class HTTPNotFound(Exception):
+        pass
+
+    aiohttp.web.HTTPBadRequest = HTTPBadRequest
+    aiohttp.web.HTTPNotFound = HTTPNotFound
+    aiohttp.web.json_response = lambda data, status=200: types.SimpleNamespace(
+        body=data, status=status
+    )
 
     server = types.ModuleType("server")
     server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
@@ -1480,38 +1510,118 @@ class AlternativeGraphTests(unittest.TestCase):
     An alternative graph joins the target workflow's current version beside its
     primary graph. The label says when Phantom should use it, and the publish
     is the only moment the author is sure to know that — so it is required
-    before a byte is uploaded, and it travels with the manifest verbatim.
+    before a byte is read, and it travels with the manifest verbatim.
     """
 
-    def test_versions_body_carries_the_alternative_block_when_present(self):
-        body = {
-            "workflow_id": "wf-1",
-            "alternative": {"label": "  Caller sends a reference image ", "description": " IP-Adapter branch "},
-        }
+    def test_sanitizes_the_label_and_the_optional_description(self):
         self.assertEqual(
-            publisher._versions_request_body(body, {"schema_version": 1}),
+            publisher._alternative_request(
+                {
+                    "alternative": {
+                        "label": "  Caller sends a reference image ",
+                        "description": " IP-Adapter branch ",
+                    }
+                }
+            ),
+            {"label": "Caller sends a reference image", "description": "IP-Adapter branch"},
+        )
+        self.assertEqual(
+            publisher._alternative_request({"alternative": {"label": "x", "description": ""}}),
+            {"label": "x"},
+        )
+        self.assertIsNone(publisher._alternative_request({"workflow_id": "wf-1"}))
+
+    def test_versions_body_carries_the_sanitized_block_when_present(self):
+        self.assertEqual(
+            publisher._versions_request_body(
+                "wf-1",
+                {"schema_version": 1},
+                {"label": "Caller sends a reference image"},
+            ),
             {
                 "workflow_id": "wf-1",
                 "manifest": {"schema_version": 1},
-                "alternative": {"label": "Caller sends a reference image", "description": "IP-Adapter branch"},
+                "alternative": {"label": "Caller sends a reference image"},
             },
         )
 
     def test_versions_body_omits_the_block_for_a_primary_publish(self):
         self.assertEqual(
-            publisher._versions_request_body({"workflow_id": "wf-1"}, {"schema_version": 1}),
+            publisher._versions_request_body("wf-1", {"schema_version": 1}, None),
             {"workflow_id": "wf-1", "manifest": {"schema_version": 1}},
         )
-        self.assertEqual(
-            publisher._versions_request_body(
-                {"workflow_id": "wf-1", "alternative": {"label": "x", "description": ""}},
-                {},
-            )["alternative"],
-            {"label": "x"},
-        )
 
-    def test_refuses_a_blank_label_before_anything_is_uploaded(self):
+    def test_refuses_a_blank_or_malformed_label(self):
         with self.assertRaises(ValueError):
             publisher._alternative_request({"alternative": {"label": "   "}})
         with self.assertRaises(ValueError):
             publisher._alternative_request({"alternative": "a label"})
+
+
+class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Discovery hashes every model and archives every custom node package before
+    the version call, so an alternative that can never be accepted has to be
+    refused by the route — not on the way out of discovery.
+    """
+
+    @staticmethod
+    def _publish_handler():
+        publisher.register_routes()
+        return publisher.PromptServer.instance.routes.handlers[
+            ("POST", "/phantom-publisher/publish")
+        ]
+
+    async def test_refuses_a_blank_label_before_a_job_exists(self):
+        jobs_before = dict(publisher._jobs)
+        started: list[Any] = []
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = started.append
+        try:
+            with self.assertRaises(publisher.web.HTTPBadRequest) as caught:
+                await self._publish_handler()(
+                    _StubRequest({"workflow_id": "wf-1", "alternative": {"label": "  "}})
+                )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertIn("label", caught.exception.text)
+        self.assertEqual(publisher._jobs, jobs_before)
+        self.assertEqual(started, [])
+
+    async def test_queues_the_job_with_the_sanitized_alternative(self):
+        original_create_task = publisher.asyncio.create_task
+        # The route never awaits the job itself, so the task is closed here
+        # rather than scheduled; `record` has already captured the arguments.
+        publisher.asyncio.create_task = lambda coroutine: coroutine.close()
+        original_run_publish = publisher._run_publish
+        calls: list[tuple[Any, ...]] = []
+
+        async def _finished() -> None:
+            return None
+
+        def record(job_id, body, alternative=None):
+            calls.append((job_id, body, alternative))
+            return _finished()
+
+        publisher._run_publish = record
+        try:
+            response = await self._publish_handler()(
+                _StubRequest(
+                    {"workflow_id": "wf-1", "alternative": {"label": "  Reference image  "}}
+                )
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+            publisher._run_publish = original_run_publish
+        self.assertEqual(response.status, 202)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2], {"label": "Reference image"})
+        publisher._jobs.pop(response.body["job_id"], None)
+
+
+class _StubRequest:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    async def json(self) -> dict[str, Any]:
+        return self._body
