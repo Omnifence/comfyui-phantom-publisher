@@ -25,9 +25,14 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.6.0"
+PUBLISHER_VERSION = "0.7.0"
+# How long a cancel waits for Phantom to abandon one upload before moving on.
+_ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
+# The running task per job, kept OUT of the job dict: the dict is what the
+# panel polls, and a Task is not JSON. Cancelling a publish is cancelling this.
+_job_tasks: dict[str, "asyncio.Task[None]"] = {}
 PUBLISH_LOG_LIMIT = 200
 
 
@@ -930,6 +935,8 @@ def _dependency_progress(
             "progress": 0,
             "status": "pending",
             "upload_required": True,
+            # What a cancel names when it asks Phantom to abandon the upload.
+            "sha256": model["sha256"],
         }
         dependencies.append(dependency)
         uploads.append((model["sha256"], Path(model["_local_path"]), size, dependency))
@@ -956,6 +963,7 @@ def _dependency_progress(
             "progress": 0 if has_upload else 100,
             "status": "pending" if has_upload else "not_required",
             "upload_required": has_upload,
+            "sha256": package.get("archive_sha256") if has_upload else None,
         }
         dependencies.append(dependency)
         if has_upload:
@@ -1096,46 +1104,53 @@ async def _upload(
     return False
 
 
-def _alternative_request(body: dict[str, Any]) -> dict[str, Any] | None:
+def _variation_request(body: dict[str, Any]) -> dict[str, Any] | None:
     """
-    The `alternative` block the dialog attached when the graph is an alternative
+    The `variation` block the dialog attached when the graph is a variation
     of the target's current version rather than a new primary. The label is
     what tells Phantom's operator WHEN to run this graph, and this is the only
     moment the author is sure to know it — so a blank one is refused by the
     publish route, before a job exists and before any dependency is inspected.
     """
-    raw = body.get("alternative")
+    raw = body.get("variation")
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        raise ValueError("alternative must be an object with a label")
+        raise ValueError("variation must be an object with a label")
+    # With an id the graph REPLACES that variation of the current version, and
+    # the label is optional: omitted, the variation keeps the one it has.
+    variation_id = str(raw.get("variation_id") or "").strip()
     label = str(raw.get("label") or "").strip()
-    if not label:
-        raise ValueError("An alternative graph needs a label saying when Phantom should use it")
+    if not label and not variation_id:
+        raise ValueError("A variation graph needs a label saying when Phantom should use it")
     description = str(raw.get("description") or "").strip()
-    return {"label": label, **({"description": description} if description else {})}
+    return {
+        **({"variation_id": variation_id} if variation_id else {}),
+        **({"label": label} if label else {}),
+        **({"description": description} if description else {}),
+    }
 
 
 def _versions_request_body(
     workflow_id: str,
     manifest: dict[str, Any],
-    alternative: dict[str, Any] | None,
+    variation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """
-    What `POST /versions` receives: the manifest, plus the alternative block when
-    there is one. The block arrives already sanitized by `_alternative_request`.
+    What `POST /versions` receives: the manifest, plus the variation block when
+    there is one. The block arrives already sanitized by `_variation_request`.
     """
     return {
         "workflow_id": workflow_id,
         "manifest": manifest,
-        **({"alternative": alternative} if alternative else {}),
+        **({"variation": variation} if variation else {}),
     }
 
 
 async def _run_publish(
     job_id: str,
     body: dict[str, Any],
-    alternative: dict[str, Any] | None = None,
+    variation: dict[str, Any] | None = None,
 ) -> None:
     job = _jobs[job_id]
     temporary_archives: list[Path] = []
@@ -1226,16 +1241,25 @@ async def _run_publish(
             "POST",
             "/versions",
             config,
-            _versions_request_body(body["workflow_id"], manifest, alternative),
+            _versions_request_body(body["workflow_id"], manifest, variation),
         )
         version_id = version["workflow_version_id"]
-        staged = version.get("alternative") if isinstance(version, dict) else None
+        job["version_id"] = version_id
+        staged = version.get("variation") if isinstance(version, dict) else None
         if isinstance(staged, dict) and staged.get("label"):
-            _job_log(
-                job,
-                f"Alternative graph \"{staged['label']}\" staged on workflow version "
-                f"v{version['version']} ({version_id}). Set when it runs in the Phantom console.",
-            )
+            if variation and variation.get("variation_id"):
+                _job_log(
+                    job,
+                    f"Variation \"{staged['label']}\" updated on workflow version "
+                    f"v{version['version']} ({version_id}). Its conditions are kept; "
+                    "check its bindings in the Phantom console.",
+                )
+            else:
+                _job_log(
+                    job,
+                    f"Variation \"{staged['label']}\" staged on workflow version "
+                    f"v{version['version']} ({version_id}). Set when it runs in the Phantom console.",
+                )
         else:
             _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
         _log_server_warnings(job, version)
@@ -1318,6 +1342,15 @@ async def _run_publish(
             bytes_uploaded=total_upload_bytes,
             version=version,
         )
+    except asyncio.CancelledError:
+        # The author pressed Cancel. Closing the panel never reaches here —
+        # this task belongs to the ComfyUI server, not the browser tab — so
+        # this is the one place the transfer actually stops. The parts already
+        # written are abandoned on Phantom too; a publish nobody is driving
+        # must not leave a half-uploaded artifact behind.
+        await _abandon_uploads(job)
+        job.update(status="cancelled", message="Publish cancelled", error=None)
+        _job_log(job, "Publish cancelled.")
     except Exception as error:  # surfaced verbatim only to the local authenticated browser session
         for dependency in job.get("dependencies", []):
             if dependency.get("status") == "uploading":
@@ -1325,8 +1358,45 @@ async def _run_publish(
         job.update(status="failed", message="Publishing failed", error=str(error))
         _job_log(job, f"{type(error).__name__}: {error}", level="error")
     finally:
+        _job_tasks.pop(job_id, None)
         for archive in temporary_archives:
             shutil.rmtree(archive.parent, ignore_errors=True)
+
+
+async def _abandon_uploads(job: dict[str, Any]) -> None:
+    """
+    Tell Phantom to abort every multipart upload this job had in flight.
+
+    Best effort: the job is already cancelled whatever Phantom answers, and a
+    cancel must not hang on a server that is the reason the author cancelled.
+    """
+    version_id = job.get("version_id")
+    for dependency in job.get("dependencies", []):
+        if dependency.get("status") != "uploading":
+            continue
+        dependency.update(status="cancelled")
+        digest = dependency.get("sha256")
+        if not version_id or not digest:
+            continue
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(
+                    _phantom_request(
+                        "DELETE",
+                        f"/versions/{version_id}/artifacts/{digest}/uploads",
+                        _read_config(),
+                    )
+                ),
+                timeout=_ABANDON_TIMEOUT_SECONDS,
+            )
+            _job_log(job, f"Abandoned the upload of {dependency.get('name', digest)}.")
+        except BaseException as error:  # noqa: BLE001 — cancellation must finish
+            _job_log(
+                job,
+                f"Could not abandon the upload of {dependency.get('name', digest)}: "
+                f"{type(error).__name__}: {error}",
+                level="warning",
+            )
 
 
 def register_routes() -> None:
@@ -1387,11 +1457,11 @@ def register_routes() -> None:
     async def publish(request: web.Request) -> web.Response:
         body = await request.json()
         try:
-            alternative = _alternative_request(body)
+            variation = _variation_request(body)
         except ValueError as error:
             # Discovery hashes every model and archives every custom node
             # package before the version call. A publish that can never succeed
-            # must not cost the author that, so an unusable alternative is
+            # must not cost the author that, so an unusable variation is
             # refused here — before a job exists and before a byte is read.
             raise web.HTTPBadRequest(text=str(error)) from error
         job_id = str(uuid.uuid4())
@@ -1408,8 +1478,25 @@ def register_routes() -> None:
             "logs": [],
         }
         _job_log(_jobs[job_id], "Publish job queued.")
-        asyncio.create_task(_run_publish(job_id, body, alternative))
+        _job_tasks[job_id] = asyncio.create_task(_run_publish(job_id, body, variation))
         return web.json_response(_jobs[job_id], status=202)
+
+    @routes.delete("/phantom-publisher/jobs/{job_id}")
+    async def publish_cancel(request: web.Request) -> web.Response:
+        job = _jobs.get(request.match_info["job_id"])
+        if not job:
+            raise web.HTTPNotFound()
+        task = _job_tasks.get(job["job_id"])
+        if task is None or task.done():
+            # Already finished one way or another; nothing left to stop.
+            return web.json_response(job)
+        _job_log(job, "Cancel requested.")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return web.json_response(job)
 
     @routes.get("/phantom-publisher/jobs/{job_id}")
     async def publish_status(request: web.Request) -> web.Response:

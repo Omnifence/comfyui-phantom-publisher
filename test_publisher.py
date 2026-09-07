@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import shutil
@@ -36,6 +37,9 @@ class _Routes:
 
     def post(self, path: str):
         return self._record("POST", path)
+
+    def delete(self, path: str):
+        return self._record("DELETE", path)
 
 
 def _load_publisher():
@@ -1505,9 +1509,9 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class AlternativeGraphTests(unittest.TestCase):
+class VariationGraphTests(unittest.TestCase):
     """
-    An alternative graph joins the target workflow's current version beside its
+    A variation graph joins the target workflow's current version beside its
     primary graph. The label says when Phantom should use it, and the publish
     is the only moment the author is sure to know that — so it is required
     before a byte is read, and it travels with the manifest verbatim.
@@ -1515,9 +1519,9 @@ class AlternativeGraphTests(unittest.TestCase):
 
     def test_sanitizes_the_label_and_the_optional_description(self):
         self.assertEqual(
-            publisher._alternative_request(
+            publisher._variation_request(
                 {
-                    "alternative": {
+                    "variation": {
                         "label": "  Caller sends a reference image ",
                         "description": " IP-Adapter branch ",
                     }
@@ -1526,10 +1530,27 @@ class AlternativeGraphTests(unittest.TestCase):
             {"label": "Caller sends a reference image", "description": "IP-Adapter branch"},
         )
         self.assertEqual(
-            publisher._alternative_request({"alternative": {"label": "x", "description": ""}}),
+            publisher._variation_request({"variation": {"label": "x", "description": ""}}),
             {"label": "x"},
         )
-        self.assertIsNone(publisher._alternative_request({"workflow_id": "wf-1"}))
+        self.assertIsNone(publisher._variation_request({"workflow_id": "wf-1"}))
+
+    def test_an_update_names_the_variation_by_id_and_may_leave_the_label_alone(self):
+        # The id says WHICH variation of the current version this graph
+        # replaces; the label is then optional and travels only when given.
+        self.assertEqual(
+            publisher._variation_request({"variation": {"variation_id": " var-1 "}}),
+            {"variation_id": "var-1"},
+        )
+        self.assertEqual(
+            publisher._variation_request(
+                {"variation": {"variation_id": "var-1", "label": " Renamed ", "description": "d"}}
+            ),
+            {"variation_id": "var-1", "label": "Renamed", "description": "d"},
+        )
+        # A blank id is no id: the label is required again.
+        with self.assertRaises(ValueError):
+            publisher._variation_request({"variation": {"variation_id": "  ", "label": ""}})
 
     def test_versions_body_carries_the_sanitized_block_when_present(self):
         self.assertEqual(
@@ -1541,7 +1562,7 @@ class AlternativeGraphTests(unittest.TestCase):
             {
                 "workflow_id": "wf-1",
                 "manifest": {"schema_version": 1},
-                "alternative": {"label": "Caller sends a reference image"},
+                "variation": {"label": "Caller sends a reference image"},
             },
         )
 
@@ -1553,15 +1574,15 @@ class AlternativeGraphTests(unittest.TestCase):
 
     def test_refuses_a_blank_or_malformed_label(self):
         with self.assertRaises(ValueError):
-            publisher._alternative_request({"alternative": {"label": "   "}})
+            publisher._variation_request({"variation": {"label": "   "}})
         with self.assertRaises(ValueError):
-            publisher._alternative_request({"alternative": "a label"})
+            publisher._variation_request({"variation": "a label"})
 
 
 class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
     """
     Discovery hashes every model and archives every custom node package before
-    the version call, so an alternative that can never be accepted has to be
+    the version call, so a variation that can never be accepted has to be
     refused by the route — not on the way out of discovery.
     """
 
@@ -1580,7 +1601,7 @@ class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertRaises(publisher.web.HTTPBadRequest) as caught:
                 await self._publish_handler()(
-                    _StubRequest({"workflow_id": "wf-1", "alternative": {"label": "  "}})
+                    _StubRequest({"workflow_id": "wf-1", "variation": {"label": "  "}})
                 )
         finally:
             publisher.asyncio.create_task = original_create_task
@@ -1588,7 +1609,7 @@ class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(publisher._jobs, jobs_before)
         self.assertEqual(started, [])
 
-    async def test_queues_the_job_with_the_sanitized_alternative(self):
+    async def test_queues_the_job_with_the_sanitized_variation(self):
         original_create_task = publisher.asyncio.create_task
         # The route never awaits the job itself, so the task is closed here
         # rather than scheduled; `record` has already captured the arguments.
@@ -1599,15 +1620,15 @@ class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
         async def _finished() -> None:
             return None
 
-        def record(job_id, body, alternative=None):
-            calls.append((job_id, body, alternative))
+        def record(job_id, body, variation=None):
+            calls.append((job_id, body, variation))
             return _finished()
 
         publisher._run_publish = record
         try:
             response = await self._publish_handler()(
                 _StubRequest(
-                    {"workflow_id": "wf-1", "alternative": {"label": "  Reference image  "}}
+                    {"workflow_id": "wf-1", "variation": {"label": "  Reference image  "}}
                 )
             )
         finally:
@@ -1617,6 +1638,119 @@ class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][2], {"label": "Reference image"})
         publisher._jobs.pop(response.body["job_id"], None)
+
+
+class CancelPublishTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Closing the panel stops nothing: the publish is a task of the ComfyUI
+    server. Cancel is what ends the transfer — and tells Phantom to abandon
+    the parts already written, so nothing half-uploaded lingers.
+    """
+
+    @staticmethod
+    def _cancel_handler():
+        publisher.register_routes()
+        return publisher.PromptServer.instance.routes.handlers[
+            ("DELETE", "/phantom-publisher/jobs/{job_id}")
+        ]
+
+    def _job(self, job_id: str, **fields: Any) -> dict[str, Any]:
+        job = {
+            "job_id": job_id,
+            "status": "uploading",
+            "progress": 50,
+            "message": "Uploading dependency 1 of 1",
+            "dependencies": [],
+            "logs": [],
+            **fields,
+        }
+        publisher._jobs[job_id] = job
+        self.addCleanup(publisher._jobs.pop, job_id, None)
+        return job
+
+    async def test_cancel_ends_the_task_and_abandons_the_uploads_in_flight(self):
+        job = self._job(
+            "job-cancel",
+            version_id="version-9",
+            dependencies=[
+                {"id": "model-0", "name": "base.safetensors", "status": "uploading", "sha256": "ab" * 32},
+                {"id": "model-1", "name": "done.safetensors", "status": "uploaded", "sha256": "cd" * 32},
+            ],
+        )
+        requests: list[tuple[str, str]] = []
+
+        async def fake_request(method, path, _config, *_args, **_kwargs):
+            requests.append((method, path))
+            return {"aborted": True}
+
+        started = asyncio.Event()
+
+        async def run_publish() -> None:
+            try:
+                started.set()
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await publisher._abandon_uploads(job)
+                job.update(status="cancelled", message="Publish cancelled", error=None)
+            finally:
+                publisher._job_tasks.pop("job-cancel", None)
+
+        original_request = publisher._phantom_request
+        original_config = publisher._read_config
+        publisher._phantom_request = fake_request
+        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
+        publisher._job_tasks["job-cancel"] = asyncio.create_task(run_publish())
+        try:
+            await started.wait()
+            response = await self._cancel_handler()(_StubMatchRequest("job-cancel"))
+        finally:
+            publisher._phantom_request = original_request
+            publisher._read_config = original_config
+        self.assertEqual(response.body["status"], "cancelled")
+        self.assertEqual(
+            requests, [("DELETE", f"/versions/version-9/artifacts/{'ab' * 32}/uploads")]
+        )
+        self.assertEqual(job["dependencies"][0]["status"], "cancelled")
+        self.assertEqual(job["dependencies"][1]["status"], "uploaded")
+        self.assertNotIn("job-cancel", publisher._job_tasks)
+        self.assertTrue(any("Cancel requested" in entry["message"] for entry in job["logs"]))
+
+    async def test_cancel_of_a_finished_job_changes_nothing(self):
+        job = self._job("job-done", status="completed", progress=100)
+        response = await self._cancel_handler()(_StubMatchRequest("job-done"))
+        self.assertEqual(response.body["status"], "completed")
+        self.assertEqual(job["logs"], [])
+
+    async def test_cancel_of_an_unknown_job_is_not_found(self):
+        with self.assertRaises(publisher.web.HTTPNotFound):
+            await self._cancel_handler()(_StubMatchRequest("job-missing"))
+
+    async def test_a_phantom_failure_does_not_stop_the_cancel(self):
+        job = self._job(
+            "job-stubborn",
+            version_id="version-9",
+            dependencies=[{"id": "model-0", "name": "big", "status": "uploading", "sha256": "ef" * 32}],
+        )
+
+        async def failing_request(*_args, **_kwargs):
+            raise RuntimeError("Phantom unreachable")
+
+        original_request = publisher._phantom_request
+        original_config = publisher._read_config
+        publisher._phantom_request = failing_request
+        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
+        try:
+            await publisher._abandon_uploads(job)
+        finally:
+            publisher._phantom_request = original_request
+            publisher._read_config = original_config
+        self.assertEqual(job["dependencies"][0]["status"], "cancelled")
+        self.assertTrue(any(entry["level"] == "warning" for entry in job["logs"]))
+
+
+class _StubMatchRequest:
+    def __init__(self, job_id: str) -> None:
+        self.match_info = {"job_id": job_id}
 
 
 class _StubRequest:

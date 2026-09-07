@@ -75,6 +75,29 @@
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
+.phantom-publisher-secondary {
+  justify-self: start;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid rgb(255 255 255 / 0.18);
+  border-radius: 0.45rem;
+  color: inherit;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+.phantom-publisher-secondary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.phantom-publisher-muted {
+  color: #9ca3af;
+}
+.phantom-publisher-dialog progress.phantom-publisher-muted {
+  accent-color: #6b7280;
+}
+.phantom-publisher-dependency[data-status='cancelled'] .phantom-publisher-dependency-state {
+  color: #9ca3af;
+}
 .phantom-publisher-link {
   padding: 0;
   border: 0;
