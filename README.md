@@ -30,8 +30,19 @@ Restart ComfyUI.
 
 The token is stored in ComfyUI's user directory as `.phantom-publisher.json`
 with mode `0600`. The publisher never writes the token into workflow JSON.
-A published workflow remembers only `origin` and `workflow_id` under top-level
-`extra.phantom`.
+A published workflow remembers only `origin`, `workflow_id` and, for an
+alternative graph, its `alternative` label under top-level `extra.phantom`.
+
+## Alternative graphs
+
+A workflow can carry more than one graph. Publish the main graph first. Then,
+with the variant open in ComfyUI, select **Publish to Phantom**, pick the same
+workflow, and set **Publish as** to *Alternative graph of the current version*.
+The dialog asks when Phantom should use this graph; that label is required, and
+it is what the operator sees when they set the conditions in the Phantom console
+(for example, "use this graph when the caller sends an image"). The alternative
+lands on a new version of the same workflow beside the main graph, never as a
+new workflow.
 
 ## What the publisher sends
 

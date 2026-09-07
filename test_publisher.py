@@ -1473,3 +1473,45 @@ class TransientNetworkFailureTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlternativeGraphTests(unittest.TestCase):
+    """
+    An alternative graph joins the target workflow's current version beside its
+    primary graph. The label says when Phantom should use it, and the publish
+    is the only moment the author is sure to know that — so it is required
+    before a byte is uploaded, and it travels with the manifest verbatim.
+    """
+
+    def test_versions_body_carries_the_alternative_block_when_present(self):
+        body = {
+            "workflow_id": "wf-1",
+            "alternative": {"label": "  Caller sends a reference image ", "description": " IP-Adapter branch "},
+        }
+        self.assertEqual(
+            publisher._versions_request_body(body, {"schema_version": 1}),
+            {
+                "workflow_id": "wf-1",
+                "manifest": {"schema_version": 1},
+                "alternative": {"label": "Caller sends a reference image", "description": "IP-Adapter branch"},
+            },
+        )
+
+    def test_versions_body_omits_the_block_for_a_primary_publish(self):
+        self.assertEqual(
+            publisher._versions_request_body({"workflow_id": "wf-1"}, {"schema_version": 1}),
+            {"workflow_id": "wf-1", "manifest": {"schema_version": 1}},
+        )
+        self.assertEqual(
+            publisher._versions_request_body(
+                {"workflow_id": "wf-1", "alternative": {"label": "x", "description": ""}},
+                {},
+            )["alternative"],
+            {"label": "x"},
+        )
+
+    def test_refuses_a_blank_label_before_anything_is_uploaded(self):
+        with self.assertRaises(ValueError):
+            publisher._alternative_request({"alternative": {"label": "   "}})
+        with self.assertRaises(ValueError):
+            publisher._alternative_request({"alternative": "a label"})

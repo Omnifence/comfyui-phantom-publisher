@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.5.2"
+PUBLISHER_VERSION = "0.6.0"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -1096,6 +1096,36 @@ async def _upload(
     return False
 
 
+def _alternative_request(body: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    The `alternative` block the dialog attached when the graph is an alternative
+    of the target's current version rather than a new primary. The label is
+    what tells Phantom's operator WHEN to run this graph, and this is the only
+    moment the author is sure to know it — so a blank one is refused here,
+    before any dependency is inspected or uploaded.
+    """
+    raw = body.get("alternative")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("alternative must be an object with a label")
+    label = str(raw.get("label") or "").strip()
+    if not label:
+        raise ValueError("An alternative graph needs a label saying when Phantom should use it")
+    description = str(raw.get("description") or "").strip()
+    return {"label": label, **({"description": description} if description else {})}
+
+
+def _versions_request_body(body: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    """What `POST /versions` receives: the manifest, plus the alternative block when there is one."""
+    alternative = _alternative_request(body)
+    return {
+        "workflow_id": body["workflow_id"],
+        "manifest": manifest,
+        **({"alternative": alternative} if alternative else {}),
+    }
+
+
 async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
     job = _jobs[job_id]
     temporary_archives: list[Path] = []
@@ -1175,11 +1205,6 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
                 {key: value for key, value in item.items() if not key.startswith("_")}
                 for item in models
             ],
-            **(
-                {"interface_mapping": body["interface_mapping"]}
-                if body.get("interface_mapping")
-                else {}
-            ),
         }
         _job_step(
             job,
@@ -1191,10 +1216,18 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
             "POST",
             "/versions",
             config,
-            {"workflow_id": body["workflow_id"], "manifest": manifest},
+            _versions_request_body(body, manifest),
         )
         version_id = version["workflow_version_id"]
-        _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
+        alternative = version.get("alternative") if isinstance(version, dict) else None
+        if isinstance(alternative, dict) and alternative.get("label"):
+            _job_log(
+                job,
+                f"Alternative graph \"{alternative['label']}\" staged on workflow version "
+                f"v{version['version']} ({version_id}). Set when it runs in the Phantom console.",
+            )
+        else:
+            _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
         _log_server_warnings(job, version)
         completed_upload_bytes = 0
         for index, (digest, path, size, dependency) in enumerate(uploads):
