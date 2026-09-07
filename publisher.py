@@ -187,11 +187,19 @@ def _default_console_origin(api_origin: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
-def _sha256(path: Path) -> tuple[str, int]:
+def _sha256(path: Path, cancellation: threading.Event | None = None) -> tuple[str, int]:
+    """
+    Digest a file, stopping between chunks once the publish is cancelled.
+
+    A cancel waits for the discovery worker rather than abandoning it, so a
+    check only between files would leave the panel on "Cancelling…" for as long
+    as one multi-gigabyte checkpoint takes to read.
+    """
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as handle:
         while chunk := handle.read(8 * 1024 * 1024):
+            _stop_if_cancelled(cancellation)
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
@@ -352,7 +360,7 @@ def _discover_models(
             if not resolved:
                 continue
             path, comfy_path = resolved
-            digest, byte_size = _sha256(path)
+            digest, byte_size = _sha256(path, cancellation)
             destination_filename = Path(filename.replace("\\", "/")).name
             destination_key = (comfy_path, destination_filename)
             safe_urls = [safe for url in urls if (safe := _safe_url(url))]
@@ -494,12 +502,27 @@ def _pip_dependencies(directory: Path) -> list[str]:
     return sorted(pinned.values())
 
 
-def _archive_package(directory: Path) -> tuple[Path, str, int]:
+def _archive_package(
+    directory: Path, cancellation: threading.Event | None = None
+) -> tuple[Path, str, int]:
     temporary = Path(tempfile.mkdtemp(prefix="phantom-publisher-")) / f"{directory.name}.tar.gz"
+    try:
+        return _write_package_archive(directory, temporary, cancellation)
+    except BaseException:
+        # A half-written archive is known only here: the caller registers an
+        # archive for deletion off the tuple this never returned.
+        shutil.rmtree(temporary.parent, ignore_errors=True)
+        raise
+
+
+def _write_package_archive(
+    directory: Path, temporary: Path, cancellation: threading.Event | None
+) -> tuple[Path, str, int]:
     with temporary.open("wb") as compressed:
         with gzip.GzipFile(filename="", mode="wb", fileobj=compressed, mtime=0) as gzip_file:
             with tarfile.open(fileobj=gzip_file, mode="w", format=tarfile.PAX_FORMAT) as archive:
                 for source in sorted(directory.rglob("*")):
+                    _stop_if_cancelled(cancellation)
                     if ".git" in source.parts or "__pycache__" in source.parts:
                         continue
                     info = archive.gettarinfo(
@@ -513,7 +536,7 @@ def _archive_package(directory: Path) -> tuple[Path, str, int]:
                             archive.addfile(info, handle)
                     else:
                         archive.addfile(info)
-    digest, size = _sha256(temporary)
+    digest, size = _sha256(temporary, cancellation)
     return temporary, digest, size
 
 
@@ -657,7 +680,7 @@ def _discover_huggingface_models(
                     on_skipped(repo_id, "no model, Space or dataset repository has that id")
                 continue
             cache_directory, revision = _huggingface_snapshot(repo_id, repo_type)
-            archive, digest, size = _archive_package(cache_directory)
+            archive, digest, size = _archive_package(cache_directory, cancellation)
             discovered.append(
                 {
                     "filename": archive.name,
@@ -818,7 +841,7 @@ def _archive_grouped_packages(
         # they are not an immutable source of truth: releases, repositories, and
         # commits can be removed. The normalized archive is content-addressed by
         # Phantom and is therefore what a workflow-version build consumes.
-        archive, digest, size = _archive_package(directory)
+        archive, digest, size = _archive_package(directory, cancellation)
         package.update(
             {
                 "archive_sha256": digest,
@@ -1523,6 +1546,28 @@ async def _abandon_uploads(job: dict[str, Any], config: dict[str, Any]) -> None:
             )
 
 
+def _running_job_for(idempotency_key: str) -> dict[str, Any] | None:
+    """
+    The job already publishing this exact payload, if one is still running.
+
+    Two ComfyUI tabs publishing the same graph read the same pending key out of
+    the browser's shared storage, so they name the SAME staged version in
+    Phantom and the same multipart uploads within it. A second job would upload
+    into that version alongside the first, and cancelling either would abort the
+    uploads the other is still writing. The second publish joins the running job
+    instead of starting one beside it.
+    """
+    if not idempotency_key:
+        return None
+    for job_id, task in _job_tasks.items():
+        if task is None or task.done():
+            continue
+        job = _jobs.get(job_id)
+        if job is not None and job.get("idempotency_key") == idempotency_key:
+            return job
+    return None
+
+
 def register_routes() -> None:
     routes = PromptServer.instance.routes
 
@@ -1588,9 +1633,18 @@ def register_routes() -> None:
             # must not cost the author that, so an unusable variation is
             # refused here — before a job exists and before a byte is read.
             raise web.HTTPBadRequest(text=str(error)) from error
+        idempotency_key = str(body.get("idempotency_key") or "").strip()
+        running = _running_job_for(idempotency_key)
+        if running is not None:
+            _job_log(
+                running,
+                "A second publish of this graph joined the job already running.",
+            )
+            return web.json_response(running, status=202)
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
             "job_id": job_id,
+            "idempotency_key": idempotency_key or None,
             "status": "queued",
             "progress": 0,
             "message": "Waiting to start…",

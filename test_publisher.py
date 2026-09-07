@@ -1640,6 +1640,7 @@ class PublishRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][2], {"label": "Reference image"})
         publisher._jobs.pop(response.body["job_id"], None)
+        publisher._job_tasks.pop(response.body["job_id"], None)
 
 
 class CancelPublishTests(unittest.IsolatedAsyncioTestCase):
@@ -1852,8 +1853,8 @@ class DiscoveryCancellationTests(unittest.IsolatedAsyncioTestCase):
         original_archive = publisher._archive_package
         written: list[Path] = []
 
-        def archive_then_cancel(directory: Path):
-            archive, digest, size = original_archive(directory)
+        def archive_then_cancel(directory: Path, cancellation_event=None):
+            archive, digest, size = original_archive(directory, cancellation_event)
             written.append(archive)
             # The author pressed Cancel while the next package was still queued.
             cancellation.set()
@@ -1921,6 +1922,154 @@ class DiscoveryCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reaped.is_set())
         self.assertEqual(job["status"], "cancelled")
         self.assertFalse(archive_root.exists())
+
+
+class _CancelAfter(threading.Event):
+    """A cancellation that trips after a set number of checks."""
+
+    def __init__(self, checks: int) -> None:
+        super().__init__()
+        self._remaining = checks
+
+    def is_set(self) -> bool:
+        if self._remaining <= 0:
+            return True
+        self._remaining -= 1
+        return False
+
+
+class LongRunningStepCancellationTests(unittest.TestCase):
+    """
+    A cancel waits for the discovery worker rather than abandoning it, so every
+    step that runs for minutes has to be interruptible from the inside. Hashing
+    a checkpoint and archiving a package are the two that read whole trees.
+    """
+
+    def _file_of(self, chunks: int) -> Path:
+        directory = Path(tempfile.mkdtemp(prefix="phantom-publisher-test-"))
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        target = directory / "checkpoint.safetensors"
+        # One byte past the chunk boundary, so `chunks` reads are needed.
+        target.write_bytes(b"\0" * (8 * 1024 * 1024 * (chunks - 1) + 1))
+        return target
+
+    def test_hashing_stops_between_chunks_not_between_files(self):
+        # The same cancellation completes a one-chunk file and stops a
+        # three-chunk one: the check is inside the read loop, not around it.
+        self.assertEqual(len(publisher._sha256(self._file_of(1), _CancelAfter(1))[0]), 64)
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._sha256(self._file_of(3), _CancelAfter(1))
+
+    def test_a_cancelled_archive_deletes_its_half_written_temp_directory(self):
+        package = Path(tempfile.mkdtemp(prefix="phantom-publisher-test-"))
+        self.addCleanup(shutil.rmtree, str(package), True)
+        for index in range(5):
+            (package / f"node_{index}.py").write_text("x = 1\n", encoding="utf-8")
+        created: list[Path] = []
+        original_mkdtemp = tempfile.mkdtemp
+
+        def record(*args: Any, **kwargs: Any) -> str:
+            directory = original_mkdtemp(*args, **kwargs)
+            created.append(Path(directory))
+            return directory
+
+        publisher.tempfile.mkdtemp = record
+        self.addCleanup(setattr, publisher.tempfile, "mkdtemp", original_mkdtemp)
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._archive_package(package, _CancelAfter(2))
+        # The caller registers an archive off the tuple this never returned, so
+        # nothing else could ever have deleted it.
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists())
+
+
+class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Two ComfyUI tabs publishing the same graph read the same pending key out of
+    the browser's shared storage. They therefore name the same staged version
+    and the same multipart uploads inside it, so a second local job would upload
+    beside the first — and cancelling either would abort the other's uploads.
+    """
+
+    @staticmethod
+    def _publish_handler():
+        publisher.register_routes()
+        return publisher.PromptServer.instance.routes.handlers[
+            ("POST", "/phantom-publisher/publish")
+        ]
+
+    async def test_a_second_publish_of_the_same_payload_joins_the_running_job(self):
+        job = {
+            "job_id": "job-first",
+            "idempotency_key": "key-1",
+            "status": "uploading",
+            "progress": 40,
+            "message": "Uploading dependency 1 of 2",
+            "dependencies": [],
+            "logs": [],
+        }
+        publisher._jobs["job-first"] = job
+        self.addCleanup(publisher._jobs.pop, "job-first", None)
+        running = asyncio.ensure_future(asyncio.sleep(3600))
+        publisher._job_tasks["job-first"] = running
+        self.addCleanup(publisher._job_tasks.pop, "job-first", None)
+        self.addCleanup(running.cancel)
+        started: list[Any] = []
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = started.append
+        try:
+            response = await self._publish_handler()(
+                _StubRequest({**_PUBLISH_BODY, "idempotency_key": "key-1"})
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertEqual(response.status, 202)
+        self.assertEqual(response.body["job_id"], "job-first")
+        self.assertEqual(started, [])
+        self.assertTrue(any("joined the job" in entry["message"] for entry in job["logs"]))
+
+    async def test_a_finished_job_never_swallows_the_next_publish(self):
+        publisher._jobs["job-done"] = {
+            "job_id": "job-done",
+            "idempotency_key": "key-2",
+            "status": "completed",
+            "logs": [],
+        }
+        self.addCleanup(publisher._jobs.pop, "job-done", None)
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = lambda coroutine: coroutine.close()
+        try:
+            response = await self._publish_handler()(
+                _StubRequest({**_PUBLISH_BODY, "idempotency_key": "key-2"})
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertNotEqual(response.body["job_id"], "job-done")
+        self.assertEqual(response.body["idempotency_key"], "key-2")
+        publisher._jobs.pop(response.body["job_id"], None)
+        publisher._job_tasks.pop(response.body["job_id"], None)
+
+    async def test_a_publish_without_a_key_starts_its_own_job(self):
+        publisher._jobs["job-keyless"] = {
+            "job_id": "job-keyless",
+            "idempotency_key": None,
+            "status": "uploading",
+            "logs": [],
+        }
+        self.addCleanup(publisher._jobs.pop, "job-keyless", None)
+        running = asyncio.ensure_future(asyncio.sleep(3600))
+        publisher._job_tasks["job-keyless"] = running
+        self.addCleanup(publisher._job_tasks.pop, "job-keyless", None)
+        self.addCleanup(running.cancel)
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = lambda coroutine: coroutine.close()
+        try:
+            response = await self._publish_handler()(_StubRequest(dict(_PUBLISH_BODY)))
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertNotEqual(response.body["job_id"], "job-keyless")
+        publisher._jobs.pop(response.body["job_id"], None)
+        publisher._job_tasks.pop(response.body["job_id"], None)
 
 
 class StagedVariationTests(unittest.IsolatedAsyncioTestCase):

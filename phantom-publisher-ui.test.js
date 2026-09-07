@@ -164,10 +164,7 @@ describe('Phantom publisher variation graphs', () => {
     // target changes, and an update starts from that variation's own text.
     matches(js, /select\.addEventListener\('change', \(\) => \{\s*rebuildPublishAs\(\);/);
     contains(js, 'publishAs.replaceChildren(...publishAsOptions(target))');
-    contains(
-      js,
-      "variationLabel.value = variation ? variation.label : rememberedVariation?.label || ''",
-    );
+    contains(js, "variationLabel.value = variation ? variation.label : remembers?.label || ''");
     // The update resolves with the id beside the label, so the server can
     // tell a replacement from a new variation.
     contains(js, '...(updating ? { variation_id: updating.variation_id } : {})');
@@ -177,7 +174,7 @@ describe('Phantom publisher variation graphs', () => {
     contains(js, 'const matched = rememberedMatch(target);');
     matches(
       js,
-      /publishAs\.value = matched\s*\? updateVariationValue\(matched\.variation_id\)\s*: rememberedVariation\s*\? PUBLISH_AS_VARIATION\s*: PUBLISH_AS_VERSION;/,
+      /publishAs\.value = matched\s*\? updateVariationValue\(matched\.variation_id\)\s*: rememberedFor\(target\)\s*\? PUBLISH_AS_VARIATION\s*: PUBLISH_AS_VERSION;/,
     );
   });
 
@@ -187,12 +184,24 @@ describe('Phantom publisher variation graphs', () => {
     // the next publish adding a duplicate of a variation that already exists.
     matches(
       js,
-      /rememberedVariation\.variation_id &&\s*variations\.find\(\(v\) => v\.variation_id === rememberedVariation\.variation_id\)/,
+      /remembers\.variation_id &&\s*variations\.find\(\(v\) => v\.variation_id === remembers\.variation_id\)/,
     );
-    matches(
+    contains(js, 'variations.find((v) => v.label === remembers.label)');
+  });
+
+  it('never carries the remembered variation to a different workflow', () => {
+    // Two workflows can label a variation the same way. Matching across them
+    // would send the other workflow's variation_id and replace a graph the
+    // author never chose, so pointing the graph elsewhere drops the block —
+    // for the matching, for the default choice, and for the prefilled label.
+    contains(
       js,
-      /rememberedVariation\.label &&\s*variations\.find\(\(v\) => v\.label === rememberedVariation\.label\)/,
+      'const rememberedFor = (target) =>\n' +
+        '    target && target.workflow_id === remembered ? rememberedVariation : null;',
     );
+    contains(js, 'const remembers = rememberedFor(target);');
+    excludes(js, 'rememberedVariation?.label');
+    excludes(js, 'rememberedVariation?.description');
   });
 
   it('reads the block 0.6.0 wrote and republishes it in the variation shape', () => {
@@ -223,7 +232,7 @@ describe('Phantom publisher variation graphs', () => {
   });
 
   it('remembers the label in the graph so a republish opens on it, and never sends a dead mapping', () => {
-    contains(js, "rememberedVariation?.label || ''");
+    contains(js, "remembers?.label || ''");
     // `graphExtra.phantom` is overwritten just before the prompt is read, so a
     // mapping read off it was always undefined. Nothing reads it now.
     excludes(js, 'interface_mapping');

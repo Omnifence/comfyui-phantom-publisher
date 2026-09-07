@@ -161,18 +161,24 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
     const id = updatedVariationId(publishAs.value);
     return id ? (target?.variations || []).find((v) => v.variation_id === id) || null : null;
   };
-  // The variation the remembered block names, by id and then by label. The
-  // label fallback is what a graph published before the id came back carries —
-  // a 0.6.0 graph, or one whose panel was closed before the publish finished —
-  // and matching it is what stops the next publish adding a duplicate.
+  // The remembered block belongs to ONE workflow. Pointing the graph at a
+  // different one drops it: two workflows can label a variation the same way,
+  // and matching across them would send the other workflow's variation_id and
+  // replace a graph the author never chose.
+  const rememberedFor = (target) =>
+    target && target.workflow_id === remembered ? rememberedVariation : null;
+  // The variation that block names, by id and then by label. The label fallback
+  // is what a graph published before the id came back carries — a 0.6.0 graph,
+  // or one whose panel was closed before the publish finished — and matching it
+  // is what stops the next publish adding a duplicate.
   const rememberedMatch = (target) => {
+    const remembers = rememberedFor(target);
+    if (!remembers) return null;
     const variations = target?.variations || [];
-    if (!rememberedVariation) return null;
     return (
-      (rememberedVariation.variation_id &&
-        variations.find((v) => v.variation_id === rememberedVariation.variation_id)) ||
-      (rememberedVariation.label &&
-        variations.find((v) => v.label === rememberedVariation.label)) ||
+      (remembers.variation_id &&
+        variations.find((v) => v.variation_id === remembers.variation_id)) ||
+      (remembers.label && variations.find((v) => v.label === remembers.label)) ||
       null
     );
   };
@@ -186,7 +192,7 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
     const matched = rememberedMatch(target);
     publishAs.value = matched
       ? updateVariationValue(matched.variation_id)
-      : rememberedVariation
+      : rememberedFor(target)
         ? PUBLISH_AS_VARIATION
         : PUBLISH_AS_VERSION;
     prefillVariationFields();
@@ -194,11 +200,13 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
   // An update starts from the variation's own label and description; a new
   // variation from whatever was remembered from the last publish.
   const prefillVariationFields = () => {
+    const target = data.targets.find((candidate) => candidate.workflow_id === select.value);
+    const remembers = rememberedFor(target);
     const variation = selectedVariation();
-    variationLabel.value = variation ? variation.label : rememberedVariation?.label || '';
+    variationLabel.value = variation ? variation.label : remembers?.label || '';
     variationDescription.value = variation
       ? variation.description || ''
-      : rememberedVariation?.description || '';
+      : remembers?.description || '';
   };
   const nameField = field('Name', name);
   const slugField = field('Slug', slug);
