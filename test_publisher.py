@@ -349,6 +349,11 @@ class _CustomNodesEnvironment:
         self.register_class(class_type, self.source_root / "nodes.py")
 
 
+def _discard(mapping: dict[str, Any], key: str) -> None:
+    """Drop a key and return nothing — see `_running_task` for why that matters."""
+    mapping.pop(key, None)
+
+
 def _workflow(nodes_spec: list[tuple[str, dict[str, Any]]]):
     api: dict[str, Any] = {}
     ui: dict[str, Any] = {"nodes": []}
@@ -1987,7 +1992,7 @@ class DiscoveryCancellationTests(unittest.IsolatedAsyncioTestCase):
         try:
             task = asyncio.ensure_future(publisher._run_publish(job_id, _PUBLISH_BODY))
             publisher._job_tasks[job_id] = task
-            self.addCleanup(publisher._job_tasks.pop, job_id, None)
+            self.addCleanup(_discard, publisher._job_tasks, job_id)
             await asyncio.to_thread(entered.wait, 5)
             task.cancel()
             # `_run_publish` handles the cancellation itself, so the task ends
@@ -2070,6 +2075,28 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
     beside the first — and cancelling either would abort the other's uploads.
     """
 
+    def _running_task(self, job_id: str):
+        """
+        Register a publish that is still in flight, and unregister it after.
+
+        Two details, both about the cleanup rather than the test:
+
+        `_discard` exists because `IsolatedAsyncioTestCase` AWAITS whatever a
+        cleanup returns, and `dict.pop` returns the task it removed. Awaiting
+        the task this method just cancelled raises CancelledError out of the
+        cleanup and errors a test whose assertions all passed — on Python 3.10,
+        where the loop runner surfaces it.
+
+        A bare Future stands in for the task because the handler only ever asks
+        whether it is done. A `create_task(asyncio.sleep(...))` would answer the
+        same question while leaving a real coroutine for loop teardown to chase.
+        """
+        running = asyncio.get_running_loop().create_future()
+        publisher._job_tasks[job_id] = running
+        self.addCleanup(_discard, publisher._job_tasks, job_id)
+        self.addCleanup(running.cancel)
+        return running
+
     @staticmethod
     def _publish_handler():
         publisher.register_routes()
@@ -2089,10 +2116,7 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
         }
         publisher._jobs["job-first"] = job
         self.addCleanup(publisher._jobs.pop, "job-first", None)
-        running = asyncio.ensure_future(asyncio.sleep(3600))
-        publisher._job_tasks["job-first"] = running
-        self.addCleanup(publisher._job_tasks.pop, "job-first", None)
-        self.addCleanup(running.cancel)
+        self._running_task("job-first")
         started: list[Any] = []
         original_create_task = publisher.asyncio.create_task
         publisher.asyncio.create_task = started.append
@@ -2136,10 +2160,7 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
             "logs": [],
         }
         self.addCleanup(publisher._jobs.pop, "job-keyless", None)
-        running = asyncio.ensure_future(asyncio.sleep(3600))
-        publisher._job_tasks["job-keyless"] = running
-        self.addCleanup(publisher._job_tasks.pop, "job-keyless", None)
-        self.addCleanup(running.cancel)
+        self._running_task("job-keyless")
         original_create_task = publisher.asyncio.create_task
         publisher.asyncio.create_task = lambda coroutine: coroutine.close()
         try:
