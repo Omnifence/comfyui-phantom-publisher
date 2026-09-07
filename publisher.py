@@ -25,7 +25,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.5.2"
+PUBLISHER_VERSION = "0.6.0"
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
 PUBLISH_LOG_LIMIT = 200
@@ -1096,7 +1096,47 @@ async def _upload(
     return False
 
 
-async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
+def _alternative_request(body: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    The `alternative` block the dialog attached when the graph is an alternative
+    of the target's current version rather than a new primary. The label is
+    what tells Phantom's operator WHEN to run this graph, and this is the only
+    moment the author is sure to know it — so a blank one is refused by the
+    publish route, before a job exists and before any dependency is inspected.
+    """
+    raw = body.get("alternative")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("alternative must be an object with a label")
+    label = str(raw.get("label") or "").strip()
+    if not label:
+        raise ValueError("An alternative graph needs a label saying when Phantom should use it")
+    description = str(raw.get("description") or "").strip()
+    return {"label": label, **({"description": description} if description else {})}
+
+
+def _versions_request_body(
+    workflow_id: str,
+    manifest: dict[str, Any],
+    alternative: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    What `POST /versions` receives: the manifest, plus the alternative block when
+    there is one. The block arrives already sanitized by `_alternative_request`.
+    """
+    return {
+        "workflow_id": workflow_id,
+        "manifest": manifest,
+        **({"alternative": alternative} if alternative else {}),
+    }
+
+
+async def _run_publish(
+    job_id: str,
+    body: dict[str, Any],
+    alternative: dict[str, Any] | None = None,
+) -> None:
     job = _jobs[job_id]
     temporary_archives: list[Path] = []
     try:
@@ -1175,11 +1215,6 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
                 {key: value for key, value in item.items() if not key.startswith("_")}
                 for item in models
             ],
-            **(
-                {"interface_mapping": body["interface_mapping"]}
-                if body.get("interface_mapping")
-                else {}
-            ),
         }
         _job_step(
             job,
@@ -1191,10 +1226,18 @@ async def _run_publish(job_id: str, body: dict[str, Any]) -> None:
             "POST",
             "/versions",
             config,
-            {"workflow_id": body["workflow_id"], "manifest": manifest},
+            _versions_request_body(body["workflow_id"], manifest, alternative),
         )
         version_id = version["workflow_version_id"]
-        _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
+        staged = version.get("alternative") if isinstance(version, dict) else None
+        if isinstance(staged, dict) and staged.get("label"):
+            _job_log(
+                job,
+                f"Alternative graph \"{staged['label']}\" staged on workflow version "
+                f"v{version['version']} ({version_id}). Set when it runs in the Phantom console.",
+            )
+        else:
+            _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
         _log_server_warnings(job, version)
         completed_upload_bytes = 0
         for index, (digest, path, size, dependency) in enumerate(uploads):
@@ -1343,6 +1386,14 @@ def register_routes() -> None:
     @routes.post("/phantom-publisher/publish")
     async def publish(request: web.Request) -> web.Response:
         body = await request.json()
+        try:
+            alternative = _alternative_request(body)
+        except ValueError as error:
+            # Discovery hashes every model and archives every custom node
+            # package before the version call. A publish that can never succeed
+            # must not cost the author that, so an unusable alternative is
+            # refused here — before a job exists and before a byte is read.
+            raise web.HTTPBadRequest(text=str(error)) from error
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
             "job_id": job_id,
@@ -1357,7 +1408,7 @@ def register_routes() -> None:
             "logs": [],
         }
         _job_log(_jobs[job_id], "Publish job queued.")
-        asyncio.create_task(_run_publish(job_id, body))
+        asyncio.create_task(_run_publish(job_id, body, alternative))
         return web.json_response(_jobs[job_id], status=202)
 
     @routes.get("/phantom-publisher/jobs/{job_id}")

@@ -95,8 +95,8 @@ Every code change ships with tests.
   `<user directory>/.phantom-publisher.json` at mode `0600`, created restricted
   rather than chmod-ed after the fact, and it must never reach workflow JSON, a
   log line or an error message.
-- A published workflow carries only `origin` and `workflow_id` under top-level
-  `extra.phantom`.
+- A published workflow carries only `origin`, `workflow_id` and, for an
+  alternative graph, its `alternative` label under top-level `extra.phantom`.
 
 ## The Phantom API contract
 

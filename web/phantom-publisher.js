@@ -103,7 +103,13 @@ const configure = (current = {}) =>
 // restarts the publish against whichever Phantom they end up connected to.
 const RECONFIGURE = Symbol('reconfigure');
 
-const chooseTarget = async (remembered, config = {}) => {
+// How a graph joins an existing workflow: as its next primary version, or as
+// an ALTERNATIVE graph of the current version that Phantom runs instead of the
+// primary when the caller's inputs meet the conditions set in the console.
+const PUBLISH_AS_VERSION = 'version';
+const PUBLISH_AS_ALTERNATIVE = 'alternative';
+
+const chooseTarget = async (remembered, config = {}, rememberedAlternative = null) => {
   const data = await request('/targets');
   const rememberedTarget = data.targets.find((target) => target.workflow_id === remembered);
   const modal = dialog();
@@ -124,9 +130,25 @@ const chooseTarget = async (remembered, config = {}) => {
   const slug = input('portrait-generator');
   const provider = document.createElement('select');
   provider.innerHTML = `<option value="runpod">RunPod</option><option value="vast-ai">Vast AI</option>`;
+  const publishAs = document.createElement('select');
+  publishAs.replaceChildren(
+    new Option('New version of the primary graph', PUBLISH_AS_VERSION),
+    new Option('Alternative graph of the current version', PUBLISH_AS_ALTERNATIVE),
+  );
+  publishAs.value = rememberedAlternative ? PUBLISH_AS_ALTERNATIVE : PUBLISH_AS_VERSION;
+  // The label is the one thing only the author knows, and only now: it tells
+  // whoever configures the conditions in Phantom WHEN this graph should run.
+  const alternativeLabel = input('e.g. Caller sends a reference image');
+  alternativeLabel.maxLength = 120;
+  alternativeLabel.value = rememberedAlternative?.label || '';
+  const alternativeDescription = input('Optional — what this graph does differently');
+  alternativeDescription.value = rememberedAlternative?.description || '';
   const nameField = field('Name', name);
   const slugField = field('Slug', slug);
   const providerField = field('Provider', provider);
+  const publishAsField = field('Publish as', publishAs);
+  const alternativeLabelField = field('When should Phantom use this graph?', alternativeLabel);
+  const alternativeDescriptionField = field('Description', alternativeDescription);
   const submit = document.createElement('button');
   submit.className = 'phantom-publisher-primary';
   const status = document.createElement('p');
@@ -134,20 +156,34 @@ const chooseTarget = async (remembered, config = {}) => {
   const updateTargetConfirmation = () => {
     const selectedTarget = data.targets.find((target) => target.workflow_id === select.value);
     const publishingNewVersion = Boolean(selectedTarget);
+    const publishingAlternative =
+      publishingNewVersion && publishAs.value === PUBLISH_AS_ALTERNATIVE;
     // The new-target fields are only HIDDEN below, never cleared, so switching
     // back to "new workflow" finds whatever the user typed still in them.
-    heading.textContent = publishingNewVersion
-      ? 'Publish new workflow version'
-      : 'Publish workflow';
-    help.textContent = publishingNewVersion
-      ? 'Confirm the destination in Phantom. Publishing will add a new version to the selected workflow; existing versions will remain unchanged.'
-      : 'Create a new workflow in Phantom and publish its first version.';
-    submit.textContent = publishingNewVersion ? 'Publish new version' : 'Create and publish';
+    heading.textContent = publishingAlternative
+      ? 'Publish alternative graph'
+      : publishingNewVersion
+        ? 'Publish new workflow version'
+        : 'Publish workflow';
+    help.textContent = publishingAlternative
+      ? "This graph joins the selected workflow's current version as an alternative, not as a new version of the workflow. Phantom runs it instead of the primary graph when the conditions set in the console hold — the label below says when."
+      : publishingNewVersion
+        ? 'Confirm the destination in Phantom. Publishing will add a new version to the selected workflow; existing versions will remain unchanged.'
+        : 'Create a new workflow in Phantom and publish its first version.';
+    submit.textContent = publishingAlternative
+      ? 'Publish alternative graph'
+      : publishingNewVersion
+        ? 'Publish new version'
+        : 'Create and publish';
     nameField.hidden = publishingNewVersion;
     slugField.hidden = publishingNewVersion;
     providerField.hidden = publishingNewVersion;
+    publishAsField.hidden = !publishingNewVersion;
+    alternativeLabelField.hidden = !publishingAlternative;
+    alternativeDescriptionField.hidden = !publishingAlternative;
   };
   select.addEventListener('change', updateTargetConfirmation);
+  publishAs.addEventListener('change', updateTargetConfirmation);
   updateTargetConfirmation();
 
   return new Promise((resolve, reject) => {
@@ -155,6 +191,26 @@ const chooseTarget = async (remembered, config = {}) => {
       try {
         if (select.value) {
           const selected = data.targets.find((target) => target.workflow_id === select.value);
+          if (publishAs.value === PUBLISH_AS_ALTERNATIVE) {
+            const label = alternativeLabel.value.trim();
+            if (!label) {
+              status.textContent =
+                'Say when Phantom should use this graph — the label is required for an alternative.';
+              alternativeLabel.focus();
+              return;
+            }
+            modal.close();
+            resolve({
+              ...selected,
+              alternative: {
+                label,
+                ...(alternativeDescription.value.trim()
+                  ? { description: alternativeDescription.value.trim() }
+                  : {}),
+              },
+            });
+            return;
+          }
           modal.close();
           resolve(selected);
           return;
@@ -194,6 +250,9 @@ const chooseTarget = async (remembered, config = {}) => {
       nameField,
       slugField,
       providerField,
+      publishAsField,
+      alternativeLabelField,
+      alternativeDescriptionField,
       submit,
       status,
       connection,
@@ -407,7 +466,7 @@ const publish = async () => {
     }
     const graphExtra = app.graph.extra || (app.graph.extra = {});
     const phantom = graphExtra.phantom || {};
-    const target = await chooseTarget(phantom.workflow_id, config);
+    const target = await chooseTarget(phantom.workflow_id, config, phantom.alternative || null);
     if (target === RECONFIGURE) {
       // The target list belongs to the old Phantom, so re-enter from the top
       // rather than reusing anything read before the switch. A dismissed
@@ -415,9 +474,12 @@ const publish = async () => {
       if (await configure(config)) return publish();
       return;
     }
+    // Remembered in the graph so the next publish of this file opens on the
+    // same target — and, for an alternative, on the same label.
     graphExtra.phantom = {
       origin: config.origin,
       workflow_id: target.workflow_id,
+      ...(target.alternative ? { alternative: target.alternative } : {}),
     };
     const refreshed = await app.graphToPrompt();
     const idempotencyStorageKey = `phantom-publisher:${target.workflow_id}:pending`;
@@ -425,7 +487,7 @@ const publish = async () => {
       workflow_id: target.workflow_id,
       api_workflow: refreshed.output,
       ui_workflow: refreshed.workflow,
-      interface_mapping: refreshed.workflow?.extra?.phantom?.interface_mapping,
+      ...(target.alternative ? { alternative: target.alternative } : {}),
     };
     const manifestFingerprint = await fingerprintPublishPayload(publishPayload);
     const idempotencyKey = selectPendingIdempotencyKey(

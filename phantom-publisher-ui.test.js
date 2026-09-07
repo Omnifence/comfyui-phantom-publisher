@@ -92,7 +92,10 @@ describe('Phantom publisher target confirmation', () => {
     matches(js, /select\.value = rememberedTarget\?\.workflow_id \|\| ''/);
     contains(js, 'Workflow in Phantom');
     contains(js, 'Publishing will add a new version to the selected workflow');
-    contains(js, "submit.textContent = publishingNewVersion ? 'Publish new version'");
+    matches(
+      js,
+      /submit\.textContent = publishingAlternative\s*\?\s*'Publish alternative graph'\s*:\s*publishingNewVersion\s*\?\s*'Publish new version'/,
+    );
     contains(js, 'nameField.hidden = publishingNewVersion');
     contains(js, 'slugField.hidden = publishingNewVersion');
     contains(js, 'providerField.hidden = publishingNewVersion');
@@ -104,5 +107,35 @@ describe('Phantom publisher target confirmation', () => {
     // value, so switching back to "new workflow" finds what was typed.
     excludes(js, 'newTargetDraft');
     excludes(js, 'showingNewTarget');
+  });
+});
+
+describe('Phantom publisher alternative graphs', () => {
+  it('offers to publish into an existing workflow as an alternative of its current version', () => {
+    contains(js, "new Option('New version of the primary graph', PUBLISH_AS_VERSION)");
+    contains(js, "new Option('Alternative graph of the current version', PUBLISH_AS_ALTERNATIVE)");
+    contains(js, 'publishAsField.hidden = !publishingNewVersion');
+    matches(js, /submit\.textContent = publishingAlternative\s*\?\s*'Publish alternative graph'/);
+    contains(
+      js,
+      "joins the selected workflow's current version as an alternative, not as a new version",
+    );
+  });
+
+  it('requires the label — it is the only moment the author knows when the graph applies', () => {
+    contains(js, 'When should Phantom use this graph?');
+    contains(js, 'alternativeLabelField.hidden = !publishingAlternative');
+    matches(js, /if \(!label\) \{[\s\S]*?the label is required for an alternative/);
+    contains(js, 'alternativeLabel.focus()');
+    // The block travels beside the graph, and the server refuses it blank too.
+    contains(js, '...(target.alternative ? { alternative: target.alternative } : {})');
+  });
+
+  it('remembers the label in the graph so a republish opens on it, and never sends a dead mapping', () => {
+    contains(js, 'chooseTarget(phantom.workflow_id, config, phantom.alternative || null)');
+    contains(js, "alternativeLabel.value = rememberedAlternative?.label || ''");
+    // `graphExtra.phantom` is overwritten just before the prompt is read, so a
+    // mapping read off it was always undefined. Nothing reads it now.
+    excludes(js, 'interface_mapping');
   });
 });
