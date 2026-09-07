@@ -27,7 +27,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.7.0"
+PUBLISHER_VERSION = "0.7.1"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -75,6 +75,27 @@ def _job_log(
     )
     if len(logs) > PUBLISH_LOG_LIMIT:
         del logs[: len(logs) - PUBLISH_LOG_LIMIT]
+
+
+def _comfy_source_root() -> Path:
+    """
+    The directory ComfyUI's own code lives in — the one holding `nodes.py`.
+
+    NOT `folder_paths.base_path`. ComfyUI reads `--base-directory` into
+    base_path, and ComfyUI Desktop always passes it: base_path then names the
+    user's data directory (models, custom_nodes, input/output/user) while the
+    source tree stays wherever the installer unpacked it. Deriving core-ness
+    from base_path on such an install declares every core class — `SaveImage`
+    included — "outside the ComfyUI installation" and refuses every publish.
+
+    The module objects are the ground truth, so read the path off them and
+    only fall back to base_path when neither carries a `__file__`.
+    """
+    for module in (sys.modules.get("nodes"), folder_paths):
+        source = getattr(module, "__file__", None)
+        if isinstance(source, str) and source:
+            return Path(source).resolve().parent
+    return Path(folder_paths.base_path).resolve()
 
 
 def _comfyui_core_version():
@@ -400,7 +421,7 @@ def _comfyui_provided_distributions() -> set[str]:
     the captured set to what the node package actually adds.
     """
     provided = {_normalize_distribution(name) for name in _TORCH_STACK}
-    requirements = Path(folder_paths.base_path) / "requirements.txt"
+    requirements = _comfy_source_root() / "requirements.txt"
     if not requirements.exists():
         return provided
     for line in requirements.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -739,7 +760,7 @@ def _discover_packages(
     # package claims resolves to a file inside that package's directory.
     ui_nodes = _node_properties(ui_workflow)
     custom_roots = [Path(root).resolve() for root in folder_paths.get_folder_paths("custom_nodes")]
-    comfy_root = Path(folder_paths.base_path).resolve()
+    comfy_root = _comfy_source_root()
 
     grouped: dict[str, dict[str, Any]] = {}
     for node_id, raw_node in api_workflow.items():
@@ -773,9 +794,11 @@ def _discover_packages(
             # `comfy-core` label — the label lies exactly when it matters.
             if comfy_root == module_file or comfy_root in module_file.parents:
                 continue
+            roots = ", ".join(str(root) for root in [comfy_root, *custom_roots])
             raise RuntimeError(
                 f'Node class "{class_type}" is defined in "{module_file}", outside both '
-                "custom_nodes and the ComfyUI installation, so it cannot be packaged."
+                "custom_nodes and the ComfyUI installation, so it cannot be packaged. "
+                f"Searched: {roots}."
             )
 
         entry = grouped.setdefault(

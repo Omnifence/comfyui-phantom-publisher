@@ -283,13 +283,21 @@ class _CustomNodesEnvironment:
     A fake ComfyUI install for package discovery: a base path, one custom_nodes
     root, and a `nodes.NODE_CLASS_MAPPINGS` whose class objects resolve to real
     files — the same chain `_discover_packages` walks in production.
+
+    `split_source_root` models a ComfyUI Desktop install, which passes
+    `--base-directory`: base_path is then the user data directory and ComfyUI's
+    own code sits somewhere else entirely. A classic install keeps both in the
+    same place, which is the default here.
     """
 
-    def __init__(self, testcase: unittest.TestCase):
+    def __init__(self, testcase: unittest.TestCase, *, split_source_root: bool = False):
         temporary = tempfile.TemporaryDirectory()
         testcase.addCleanup(temporary.cleanup)
         self.testcase = testcase
         self.root = Path(temporary.name)
+        self.source_root = self.root / "comfyui-source" if split_source_root else self.root
+        self.source_root.mkdir(exist_ok=True)
+        (self.source_root / "nodes.py").touch()
         self.custom_nodes = self.root / "custom_nodes"
         self.custom_nodes.mkdir()
         self.mappings: dict[str, type] = {}
@@ -300,7 +308,10 @@ class _CustomNodesEnvironment:
             [str(self.custom_nodes)] if kind == "custom_nodes" else []
         )
         testcase.addCleanup(self._restore)
-        sys.modules["nodes"] = types.SimpleNamespace(NODE_CLASS_MAPPINGS=self.mappings)
+        sys.modules["nodes"] = types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS=self.mappings,
+            __file__=str(self.source_root / "nodes.py"),
+        )
         testcase.addCleanup(sys.modules.pop, "nodes", None)
 
     def _restore(self) -> None:
@@ -328,10 +339,19 @@ class _CustomNodesEnvironment:
         return directory
 
     def core_class(self, class_type: str) -> None:
-        source = self.root / "comfy_extras" / "nodes_core.py"
+        source = self.source_root / "comfy_extras" / "nodes_core.py"
         source.parent.mkdir(exist_ok=True)
         source.touch()
         self.register_class(class_type, source)
+
+    def core_root_class(self, class_type: str) -> None:
+        """A class defined in ComfyUI's own `nodes.py`, like `SaveImage`."""
+        self.register_class(class_type, self.source_root / "nodes.py")
+
+
+def _discard(mapping: dict[str, Any], key: str) -> None:
+    """Drop a key and return nothing — see `_running_task` for why that matters."""
+    mapping.pop(key, None)
 
 
 def _workflow(nodes_spec: list[tuple[str, dict[str, Any]]]):
@@ -446,6 +466,70 @@ class PackageAttributionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 self._discover(env, [("StrayNode", {})])
         self.assertIn("StrayNode", str(caught.exception))
+
+class DesktopInstallTests(unittest.TestCase):
+    """
+    ComfyUI Desktop starts the server with `--base-directory`, so
+    `folder_paths.base_path` is the user data directory and ComfyUI's own code
+    lives somewhere else. Reading core-ness off base_path called every core
+    class — `SaveImage` first — "outside the ComfyUI installation" and refused
+    every publish from such a machine at 10%.
+    """
+
+    def _discover(self, env, nodes_spec):
+        packages = publisher._discover_packages(*_workflow(nodes_spec))
+        for package in packages:
+            if package.get("_archive_path"):
+                self.addCleanup(
+                    shutil.rmtree, str(Path(package["_archive_path"]).parent), ignore_errors=True
+                )
+        return packages
+
+    def test_core_classes_are_skipped_when_base_path_is_not_the_source_root(self):
+        env = _CustomNodesEnvironment(self, split_source_root=True)
+        env.core_root_class("SaveImage")
+        env.core_class("KSampler")
+        self.assertNotEqual(env.source_root, env.root)
+        self.assertEqual(
+            self._discover(env, [("SaveImage", {"cnr_id": "comfy-core"}), ("KSampler", {})]),
+            [],
+        )
+
+    def test_custom_packages_still_group_under_a_split_base_directory(self):
+        env = _CustomNodesEnvironment(self, split_source_root=True)
+        package = env.package("comfyui-example", ["ExampleNode"])
+        env.core_root_class("SaveImage")
+        packages = self._discover(
+            env,
+            [("ExampleNode", {"cnr_id": "comfyui-example", "ver": "1.2.3"}), ("SaveImage", {})],
+        )
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0]["class_types"], ["ExampleNode"])
+        self.assertEqual(Path(packages[0]["_package_directory"]).resolve(), package.resolve())
+
+    def test_a_stray_class_still_fails_and_names_every_searched_root(self):
+        env = _CustomNodesEnvironment(self, split_source_root=True)
+        with tempfile.TemporaryDirectory() as elsewhere:
+            stray = Path(elsewhere) / "stray.py"
+            stray.write_text("class StrayNode:\n    pass\n", encoding="utf-8")
+            env.register_class("StrayNode", stray)
+            with self.assertRaises(RuntimeError) as caught:
+                self._discover(env, [("StrayNode", {})])
+        message = str(caught.exception)
+        self.assertIn("StrayNode", message)
+        self.assertIn(str(env.source_root), message)
+        self.assertIn(str(env.custom_nodes), message)
+
+    def test_source_root_prefers_the_nodes_module_over_the_base_path(self):
+        env = _CustomNodesEnvironment(self, split_source_root=True)
+        self.assertEqual(publisher._comfy_source_root(), env.source_root.resolve())
+
+    def test_source_root_falls_back_to_the_base_path_without_a_nodes_module(self):
+        env = _CustomNodesEnvironment(self)
+        sys.modules.pop("nodes", None)
+        self.assertEqual(publisher._comfy_source_root(), env.root.resolve())
+
+
 
 
 class GitMetadataTests(unittest.TestCase):
@@ -1908,7 +1992,7 @@ class DiscoveryCancellationTests(unittest.IsolatedAsyncioTestCase):
         try:
             task = asyncio.ensure_future(publisher._run_publish(job_id, _PUBLISH_BODY))
             publisher._job_tasks[job_id] = task
-            self.addCleanup(publisher._job_tasks.pop, job_id, None)
+            self.addCleanup(_discard, publisher._job_tasks, job_id)
             await asyncio.to_thread(entered.wait, 5)
             task.cancel()
             # `_run_publish` handles the cancellation itself, so the task ends
@@ -1991,6 +2075,28 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
     beside the first — and cancelling either would abort the other's uploads.
     """
 
+    def _running_task(self, job_id: str):
+        """
+        Register a publish that is still in flight, and unregister it after.
+
+        Two details, both about the cleanup rather than the test:
+
+        `_discard` exists because `IsolatedAsyncioTestCase` AWAITS whatever a
+        cleanup returns, and `dict.pop` returns the task it removed. Awaiting
+        the task this method just cancelled raises CancelledError out of the
+        cleanup and errors a test whose assertions all passed — on Python 3.10,
+        where the loop runner surfaces it.
+
+        A bare Future stands in for the task because the handler only ever asks
+        whether it is done. A `create_task(asyncio.sleep(...))` would answer the
+        same question while leaving a real coroutine for loop teardown to chase.
+        """
+        running = asyncio.get_running_loop().create_future()
+        publisher._job_tasks[job_id] = running
+        self.addCleanup(_discard, publisher._job_tasks, job_id)
+        self.addCleanup(running.cancel)
+        return running
+
     @staticmethod
     def _publish_handler():
         publisher.register_routes()
@@ -2010,10 +2116,7 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
         }
         publisher._jobs["job-first"] = job
         self.addCleanup(publisher._jobs.pop, "job-first", None)
-        running = asyncio.ensure_future(asyncio.sleep(3600))
-        publisher._job_tasks["job-first"] = running
-        self.addCleanup(publisher._job_tasks.pop, "job-first", None)
-        self.addCleanup(running.cancel)
+        self._running_task("job-first")
         started: list[Any] = []
         original_create_task = publisher.asyncio.create_task
         publisher.asyncio.create_task = started.append
@@ -2057,10 +2160,7 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
             "logs": [],
         }
         self.addCleanup(publisher._jobs.pop, "job-keyless", None)
-        running = asyncio.ensure_future(asyncio.sleep(3600))
-        publisher._job_tasks["job-keyless"] = running
-        self.addCleanup(publisher._job_tasks.pop, "job-keyless", None)
-        self.addCleanup(running.cancel)
+        self._running_task("job-keyless")
         original_create_task = publisher.asyncio.create_task
         publisher.asyncio.create_task = lambda coroutine: coroutine.close()
         try:
