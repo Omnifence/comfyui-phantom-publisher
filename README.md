@@ -30,19 +30,42 @@ Restart ComfyUI.
 
 The token is stored in ComfyUI's user directory as `.phantom-publisher.json`
 with mode `0600`. The publisher never writes the token into workflow JSON.
-A published workflow remembers only `origin`, `workflow_id` and, for an
-alternative graph, its `alternative` label under top-level `extra.phantom`.
+A published workflow remembers only `origin`, `workflow_id` and, for a
+variation, its `variation` block (id and label) under top-level `extra.phantom`.
 
-## Alternative graphs
+## Variations
 
-A workflow can carry more than one graph. Publish the main graph first. Then,
-with the variant open in ComfyUI, select **Publish to Phantom**, pick the same
-workflow, and set **Publish as** to *Alternative graph of the current version*.
-The dialog asks when Phantom should use this graph; that label is required, and
-it is what the operator sees when they set the conditions in the Phantom console
-(for example, "use this graph when the caller sends an image"). The alternative
-lands on a new version of the same workflow beside the main graph, never as a
-new workflow.
+A workflow version can carry more than one graph: the primary graph and any
+number of variations. Phantom runs a variation instead of the primary when the
+conditions set for it in the Phantom console hold (for example, "use this
+graph when the caller sends an image"). Every publish lands as a new version
+of the workflow; the previous version stays as it was.
+
+Publish the primary graph first. Then, with a graph open in ComfyUI, select
+**Publish to Phantom**, pick the workflow, and choose under **Publish as**:
+
+- **New version — replace the primary graph.** The current variations carry
+  forward unchanged.
+- **Update variation: _label_.** One entry per variation the current version
+  has. The graph replaces that variation; its conditions are kept and its
+  bindings are read again from the new graph. The label and description can be
+  changed here.
+- **New variation of the current version.** The dialog asks when Phantom
+  should use this graph. That label is required: publishing is the only moment
+  the author is sure to know it, and it is what the operator sees when they
+  set the conditions in the console.
+
+Dependencies are matched by digest, so models and custom nodes shared between
+graphs are uploaded once and one image serves every graph of the version.
+
+## Cancelling a publish
+
+Closing the progress panel does not stop the upload: the publish runs inside
+the ComfyUI server, and the panel only watches it. Press **Cancel publish** in
+the panel to end it. The publisher stops the transfer and asks Phantom to
+abandon the parts it had already uploaded, so nothing half-uploaded is left
+behind. The staged version stays in Phantom; a later publish of the same
+workflow fills it in.
 
 ## What the publisher sends
 

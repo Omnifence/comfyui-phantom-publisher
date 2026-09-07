@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import gzip
 import hashlib
 import importlib.metadata
@@ -13,11 +14,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import aiohttp
 from aiohttp import web
@@ -25,10 +27,32 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.6.0"
+PUBLISHER_VERSION = "0.7.0"
+# How long a cancel waits for Phantom to abandon one upload before moving on.
+_ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
 _jobs: dict[str, dict[str, Any]] = {}
+# The running task per job, kept OUT of the job dict: the dict is what the
+# panel polls, and a Task is not JSON. Cancelling a publish is cancelling this.
+_job_tasks: dict[str, "asyncio.Task[None]"] = {}
 PUBLISH_LOG_LIMIT = 200
+
+
+class _DiscoveryCancelled(Exception):
+    """Raised inside a discovery worker once the author has cancelled."""
+
+
+def _stop_if_cancelled(cancellation: threading.Event | None) -> None:
+    """
+    Cooperative cancellation for the discovery threads.
+
+    `asyncio.to_thread` cannot interrupt a worker: cancelling the task ends the
+    await, not the thread. Hashing a model set, archiving packages and
+    downloading Hugging Face snapshots each take minutes, so every discovery
+    loop calls this between items and stops there.
+    """
+    if cancellation is not None and cancellation.is_set():
+        raise _DiscoveryCancelled("The publish was cancelled during discovery")
 
 
 def _job_log(
@@ -163,11 +187,19 @@ def _default_console_origin(api_origin: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
-def _sha256(path: Path) -> tuple[str, int]:
+def _sha256(path: Path, cancellation: threading.Event | None = None) -> tuple[str, int]:
+    """
+    Digest a file, stopping between chunks once the publish is cancelled.
+
+    A cancel waits for the discovery worker rather than abandoning it, so a
+    check only between files would leave the panel on "Cancelling…" for as long
+    as one multi-gigabyte checkpoint takes to read.
+    """
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as handle:
         while chunk := handle.read(8 * 1024 * 1024):
+            _stop_if_cancelled(cancellation)
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
@@ -283,7 +315,11 @@ def _resolve_model(filename: str, model_type: str) -> tuple[Path, str] | None:
     return None
 
 
-def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) -> list[dict[str, Any]]:
+def _discover_models(
+    api_workflow: dict[str, Any],
+    ui_workflow: dict[str, Any],
+    cancellation: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     ui_nodes = _node_properties(ui_workflow)
     # The destination path is part of the workflow contract. Two filenames may
     # intentionally contain the same bytes (aliases, hard links, or copied
@@ -291,6 +327,7 @@ def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) 
     # image even though its node still references it.
     discovered: dict[tuple[str, str], dict[str, Any]] = {}
     for node_id, raw_node in api_workflow.items():
+        _stop_if_cancelled(cancellation)
         if not isinstance(raw_node, dict):
             continue
         ui_node = ui_nodes.get(str(node_id), {})
@@ -316,11 +353,14 @@ def _discover_models(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) 
                         candidates.append((value, model_type, []))
                         break
         for filename, model_type, urls in candidates:
+            # Reading a multi-gigabyte checkpoint to hash it is the slowest step
+            # in discovery, so the flag is checked before each one.
+            _stop_if_cancelled(cancellation)
             resolved = _resolve_model(filename, model_type)
             if not resolved:
                 continue
             path, comfy_path = resolved
-            digest, byte_size = _sha256(path)
+            digest, byte_size = _sha256(path, cancellation)
             destination_filename = Path(filename.replace("\\", "/")).name
             destination_key = (comfy_path, destination_filename)
             safe_urls = [safe for url in urls if (safe := _safe_url(url))]
@@ -462,12 +502,27 @@ def _pip_dependencies(directory: Path) -> list[str]:
     return sorted(pinned.values())
 
 
-def _archive_package(directory: Path) -> tuple[Path, str, int]:
+def _archive_package(
+    directory: Path, cancellation: threading.Event | None = None
+) -> tuple[Path, str, int]:
     temporary = Path(tempfile.mkdtemp(prefix="phantom-publisher-")) / f"{directory.name}.tar.gz"
+    try:
+        return _write_package_archive(directory, temporary, cancellation)
+    except BaseException:
+        # A half-written archive is known only here: the caller registers an
+        # archive for deletion off the tuple this never returned.
+        shutil.rmtree(temporary.parent, ignore_errors=True)
+        raise
+
+
+def _write_package_archive(
+    directory: Path, temporary: Path, cancellation: threading.Event | None
+) -> tuple[Path, str, int]:
     with temporary.open("wb") as compressed:
         with gzip.GzipFile(filename="", mode="wb", fileobj=compressed, mtime=0) as gzip_file:
             with tarfile.open(fileobj=gzip_file, mode="w", format=tarfile.PAX_FORMAT) as archive:
                 for source in sorted(directory.rglob("*")):
+                    _stop_if_cancelled(cancellation)
                     if ".git" in source.parts or "__pycache__" in source.parts:
                         continue
                     info = archive.gettarinfo(
@@ -481,7 +536,7 @@ def _archive_package(directory: Path) -> tuple[Path, str, int]:
                             archive.addfile(info, handle)
                     else:
                         archive.addfile(info)
-    digest, size = _sha256(temporary)
+    digest, size = _sha256(temporary, cancellation)
     return temporary, digest, size
 
 
@@ -603,6 +658,7 @@ def _discover_huggingface_models(
     packages: list[dict[str, Any]],
     on_repository: Callable[[str, int, int], None] | None = None,
     on_skipped: Callable[[str, str], None] | None = None,
+    cancellation: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     discovered: list[dict[str, Any]] = []
     repo_ids: set[str] = set()
@@ -612,6 +668,7 @@ def _discover_huggingface_models(
     try:
         sorted_repo_ids = sorted(repo_ids)
         for index, repo_id in enumerate(sorted_repo_ids):
+            _stop_if_cancelled(cancellation)
             if on_repository:
                 on_repository(repo_id, index, len(sorted_repo_ids))
             repo_type = _huggingface_repo_type(repo_id)
@@ -623,7 +680,7 @@ def _discover_huggingface_models(
                     on_skipped(repo_id, "no model, Space or dataset repository has that id")
                 continue
             cache_directory, revision = _huggingface_snapshot(repo_id, repo_type)
-            archive, digest, size = _archive_package(cache_directory)
+            archive, digest, size = _archive_package(cache_directory, cancellation)
             discovered.append(
                 {
                     "filename": archive.name,
@@ -640,7 +697,7 @@ def _discover_huggingface_models(
                     "_local_path": str(archive),
                 }
             )
-    except Exception:
+    except BaseException:
         for item in discovered:
             shutil.rmtree(Path(item["_local_path"]).parent, ignore_errors=True)
         raise
@@ -663,7 +720,11 @@ def _class_source_file(nodes_module: Any, class_type: str) -> tuple[Path | None,
     return (Path(module_file).resolve() if module_file else None), module_name
 
 
-def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]) -> list[dict[str, Any]]:
+def _discover_packages(
+    api_workflow: dict[str, Any],
+    ui_workflow: dict[str, Any],
+    cancellation: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     import nodes
 
     # The archived directory always comes from the CLASS OBJECT, never from the
@@ -682,6 +743,7 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
 
     grouped: dict[str, dict[str, Any]] = {}
     for node_id, raw_node in api_workflow.items():
+        _stop_if_cancelled(cancellation)
         if not isinstance(raw_node, dict) or not isinstance(raw_node.get("class_type"), str):
             continue
         class_type = raw_node["class_type"]
@@ -730,7 +792,30 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
                 entry["mismatches"].append({"class_type": class_type, "labeled_cnr_id": cnr_id})
 
     result: list[dict[str, Any]] = []
+    try:
+        result.extend(_archive_grouped_packages(grouped, cancellation))
+    except BaseException:
+        # Whatever was archived belongs to a publish that will not happen, and
+        # only this frame knows where those archives are — the caller registers
+        # them for deletion off the RETURNED list, which a raise never produces.
+        for item in result:
+            shutil.rmtree(Path(item["_archive_path"]).parent, ignore_errors=True)
+        raise
+    return result
+
+
+def _archive_grouped_packages(
+    grouped: dict[str, dict[str, Any]],
+    cancellation: threading.Event | None,
+) -> Iterator[dict[str, Any]]:
+    """
+    Archive one package per resolved directory, yielding each as it lands.
+
+    A generator so a cancelled or failed run still hands its caller everything
+    written up to that point, which is what has to be deleted.
+    """
     for directory_key in sorted(grouped):
+        _stop_if_cancelled(cancellation)
         entry = grouped[directory_key]
         directory = Path(directory_key)
         # Registry coordinates stay as PROVENANCE when the label agrees with the
@@ -756,7 +841,7 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
         # they are not an immutable source of truth: releases, repositories, and
         # commits can be removed. The normalized archive is content-addressed by
         # Phantom and is therefore what a workflow-version build consumes.
-        archive, digest, size = _archive_package(directory)
+        archive, digest, size = _archive_package(directory, cancellation)
         package.update(
             {
                 "archive_sha256": digest,
@@ -764,8 +849,7 @@ def _discover_packages(api_workflow: dict[str, Any], ui_workflow: dict[str, Any]
                 "_archive_size": size,
             }
         )
-        result.append(package)
-    return result
+        yield package
 
 
 def _parse_json_body(raw: str) -> Any | None:
@@ -930,6 +1014,8 @@ def _dependency_progress(
             "progress": 0,
             "status": "pending",
             "upload_required": True,
+            # What a cancel names when it asks Phantom to abandon the upload.
+            "sha256": model["sha256"],
         }
         dependencies.append(dependency)
         uploads.append((model["sha256"], Path(model["_local_path"]), size, dependency))
@@ -956,6 +1042,7 @@ def _dependency_progress(
             "progress": 0 if has_upload else 100,
             "status": "pending" if has_upload else "not_required",
             "upload_required": has_upload,
+            "sha256": package.get("archive_sha256") if has_upload else None,
         }
         dependencies.append(dependency)
         if has_upload:
@@ -1096,49 +1183,110 @@ async def _upload(
     return False
 
 
-def _alternative_request(body: dict[str, Any]) -> dict[str, Any] | None:
+def _variation_request(body: dict[str, Any]) -> dict[str, Any] | None:
     """
-    The `alternative` block the dialog attached when the graph is an alternative
+    The `variation` block the dialog attached when the graph is a variation
     of the target's current version rather than a new primary. The label is
     what tells Phantom's operator WHEN to run this graph, and this is the only
     moment the author is sure to know it — so a blank one is refused by the
     publish route, before a job exists and before any dependency is inspected.
     """
-    raw = body.get("alternative")
+    raw = body.get("variation")
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        raise ValueError("alternative must be an object with a label")
+        raise ValueError("variation must be an object with a label")
+    # With an id the graph REPLACES that variation of the current version, and
+    # the label is optional: omitted, the variation keeps the one it has.
+    variation_id = str(raw.get("variation_id") or "").strip()
     label = str(raw.get("label") or "").strip()
-    if not label:
-        raise ValueError("An alternative graph needs a label saying when Phantom should use it")
+    if not label and not variation_id:
+        raise ValueError("A variation graph needs a label saying when Phantom should use it")
     description = str(raw.get("description") or "").strip()
-    return {"label": label, **({"description": description} if description else {})}
+    return {
+        **({"variation_id": variation_id} if variation_id else {}),
+        **({"label": label} if label else {}),
+        **({"description": description} if description else {}),
+    }
 
 
 def _versions_request_body(
     workflow_id: str,
     manifest: dict[str, Any],
-    alternative: dict[str, Any] | None,
+    variation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """
-    What `POST /versions` receives: the manifest, plus the alternative block when
-    there is one. The block arrives already sanitized by `_alternative_request`.
+    What `POST /versions` receives: the manifest, plus the variation block when
+    there is one. The block arrives already sanitized by `_variation_request`.
     """
     return {
         "workflow_id": workflow_id,
         "manifest": manifest,
-        **({"alternative": alternative} if alternative else {}),
+        **({"variation": variation} if variation else {}),
     }
+
+
+def _package_archives(packages: list[dict[str, Any]]) -> list[Path]:
+    """The temporary archive written for each discovered node package."""
+    return [Path(item["_archive_path"]) for item in packages if item.get("_archive_path")]
+
+
+def _external_model_archives(models: list[dict[str, Any]]) -> list[Path]:
+    """The temporary archive written for each snapshotted external model."""
+    return [
+        Path(item["_local_path"]) for item in models if item.get("archive_format") == "tar.gz"
+    ]
 
 
 async def _run_publish(
     job_id: str,
     body: dict[str, Any],
-    alternative: dict[str, Any] | None = None,
+    variation: dict[str, Any] | None = None,
 ) -> None:
     job = _jobs[job_id]
     temporary_archives: list[Path] = []
+    # Set when the author cancels, and read by the discovery workers between
+    # items. Cancelling the task cannot stop a thread; this is what does.
+    cancellation = threading.Event()
+    # The connection this publish belongs to, read once. Cancellation cleanup
+    # uses THIS one: another tab can point the config at a different Phantom
+    # mid-publish, and the staged version only exists in the one that made it.
+    config: dict[str, Any] = {}
+
+    async def discover(
+        function: Callable[..., Any],
+        *args: Any,
+        archives: Callable[[Any], list[Path]] = lambda _result: [],
+    ) -> Any:
+        """
+        Run one blocking discovery call, and never leave its worker behind.
+
+        A cancelled `to_thread` await ends the await, not the thread: the job
+        would report itself cancelled while models were still being hashed and
+        archives still being written, and those archives — registered only once
+        the call returns — would never be deleted. The worker is reaped here
+        instead, and whatever it produced is registered before the cancellation
+        travels on.
+        """
+        worker = asyncio.ensure_future(asyncio.to_thread(function, *args, cancellation))
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.set()
+            _job_step(
+                job,
+                "Cancelling — waiting for the workflow inspection to stop…",
+                status="cancelling",
+            )
+            reaped: Any = None
+            with contextlib.suppress(BaseException):
+                reaped = await worker
+            if reaped is not None:
+                temporary_archives.extend(archives(reaped))
+            raise
+        temporary_archives.extend(archives(result))
+        return result
+
     try:
         config = _read_config()
         _job_step(
@@ -1149,13 +1297,13 @@ async def _run_publish(
         )
         api_workflow = body["api_workflow"]
         ui_workflow = body["ui_workflow"]
-        models = await asyncio.to_thread(_discover_models, api_workflow, ui_workflow)
-        packages = await asyncio.to_thread(_discover_packages, api_workflow, ui_workflow)
-        temporary_archives = [
-            Path(item["_archive_path"])
-            for item in packages
-            if item.get("_archive_path")
-        ]
+        models = await discover(_discover_models, api_workflow, ui_workflow)
+        packages = await discover(
+            _discover_packages,
+            api_workflow,
+            ui_workflow,
+            archives=_package_archives,
+        )
 
         def report_external_repository(repo_id: str, index: int, total: int) -> None:
             _job_step(
@@ -1174,17 +1322,13 @@ async def _run_publish(
             status="snapshotting_external_models",
             progress=20,
         )
-        models += await asyncio.to_thread(
+        models += await discover(
             _discover_huggingface_models,
             packages,
             report_external_repository,
             report_skipped_repository,
+            archives=_external_model_archives,
         )
-        temporary_archives += [
-            Path(item["_local_path"])
-            for item in models
-            if item.get("archive_format") == "tar.gz"
-        ]
         dependencies, uploads = _dependency_progress(models, packages)
         total_upload_bytes = sum(size for _, _, size, _ in uploads)
         job.update(
@@ -1226,16 +1370,33 @@ async def _run_publish(
             "POST",
             "/versions",
             config,
-            _versions_request_body(body["workflow_id"], manifest, alternative),
+            _versions_request_body(body["workflow_id"], manifest, variation),
         )
         version_id = version["workflow_version_id"]
-        staged = version.get("alternative") if isinstance(version, dict) else None
+        job["version_id"] = version_id
+        staged = version.get("variation") if isinstance(version, dict) else None
+        if isinstance(staged, dict) and staged.get("variation_id"):
+            # The id Phantom assigned. The panel writes it back into the graph,
+            # so the next publish of this file offers "update this variation"
+            # rather than adding a second one under the same label.
+            job["variation"] = {
+                "variation_id": staged["variation_id"],
+                **({"label": staged["label"]} if staged.get("label") else {}),
+            }
         if isinstance(staged, dict) and staged.get("label"):
-            _job_log(
-                job,
-                f"Alternative graph \"{staged['label']}\" staged on workflow version "
-                f"v{version['version']} ({version_id}). Set when it runs in the Phantom console.",
-            )
+            if variation and variation.get("variation_id"):
+                _job_log(
+                    job,
+                    f"Variation \"{staged['label']}\" updated on workflow version "
+                    f"v{version['version']} ({version_id}). Its conditions are kept; "
+                    "check its bindings in the Phantom console.",
+                )
+            else:
+                _job_log(
+                    job,
+                    f"Variation \"{staged['label']}\" staged on workflow version "
+                    f"v{version['version']} ({version_id}). Set when it runs in the Phantom console.",
+                )
         else:
             _job_log(job, f"Workflow version v{version['version']} staged as {version_id}.")
         _log_server_warnings(job, version)
@@ -1318,6 +1479,15 @@ async def _run_publish(
             bytes_uploaded=total_upload_bytes,
             version=version,
         )
+    except asyncio.CancelledError:
+        # The author pressed Cancel. Closing the panel never reaches here —
+        # this task belongs to the ComfyUI server, not the browser tab — so
+        # this is the one place the transfer actually stops. The parts already
+        # written are abandoned on Phantom too; a publish nobody is driving
+        # must not leave a half-uploaded artifact behind.
+        await _abandon_uploads(job, config)
+        job.update(status="cancelled", message="Publish cancelled", error=None)
+        _job_log(job, "Publish cancelled.")
     except Exception as error:  # surfaced verbatim only to the local authenticated browser session
         for dependency in job.get("dependencies", []):
             if dependency.get("status") == "uploading":
@@ -1325,8 +1495,77 @@ async def _run_publish(
         job.update(status="failed", message="Publishing failed", error=str(error))
         _job_log(job, f"{type(error).__name__}: {error}", level="error")
     finally:
+        _job_tasks.pop(job_id, None)
         for archive in temporary_archives:
             shutil.rmtree(archive.parent, ignore_errors=True)
+
+
+async def _abandon_uploads(job: dict[str, Any], config: dict[str, Any]) -> None:
+    """
+    Tell Phantom to abort every multipart upload this job had in flight.
+
+    `config` is the connection the publish itself used. Re-reading the file
+    here would address whatever Phantom the config names NOW — another tab can
+    change it mid-publish — sending a DELETE for a version that only exists in
+    the old one, against an id that may name something else in the new one.
+
+    Best effort: the job is already cancelled whatever Phantom answers, and a
+    cancel must not hang on a server that is the reason the author cancelled.
+    """
+    version_id = job.get("version_id")
+    for dependency in job.get("dependencies", []):
+        if dependency.get("status") != "uploading":
+            continue
+        dependency.update(status="cancelled")
+        digest = dependency.get("sha256")
+        if not version_id or not digest or not config.get("token"):
+            continue
+        # Awaited as a task, unshielded: a shielded `wait_for` cancels only the
+        # wrapper, so the DELETE stayed in flight for its full 60s connect
+        # timeout and could land AFTER a retry resumed the same staged version
+        # — aborting that retry's upload instead of this one's.
+        abandon = asyncio.ensure_future(
+            _phantom_request(
+                "DELETE",
+                f"/versions/{version_id}/artifacts/{digest}/uploads",
+                config,
+            )
+        )
+        try:
+            await asyncio.wait_for(abandon, timeout=_ABANDON_TIMEOUT_SECONDS)
+            _job_log(job, f"Abandoned the upload of {dependency.get('name', digest)}.")
+        except BaseException as error:  # noqa: BLE001 — cancellation must finish
+            abandon.cancel()
+            with contextlib.suppress(BaseException):
+                await abandon
+            _job_log(
+                job,
+                f"Could not abandon the upload of {dependency.get('name', digest)}: "
+                f"{type(error).__name__}: {error}",
+                level="warning",
+            )
+
+
+def _running_job_for(idempotency_key: str) -> dict[str, Any] | None:
+    """
+    The job already publishing this exact payload, if one is still running.
+
+    Two ComfyUI tabs publishing the same graph read the same pending key out of
+    the browser's shared storage, so they name the SAME staged version in
+    Phantom and the same multipart uploads within it. A second job would upload
+    into that version alongside the first, and cancelling either would abort the
+    uploads the other is still writing. The second publish joins the running job
+    instead of starting one beside it.
+    """
+    if not idempotency_key:
+        return None
+    for job_id, task in _job_tasks.items():
+        if task is None or task.done():
+            continue
+        job = _jobs.get(job_id)
+        if job is not None and job.get("idempotency_key") == idempotency_key:
+            return job
+    return None
 
 
 def register_routes() -> None:
@@ -1387,16 +1626,25 @@ def register_routes() -> None:
     async def publish(request: web.Request) -> web.Response:
         body = await request.json()
         try:
-            alternative = _alternative_request(body)
+            variation = _variation_request(body)
         except ValueError as error:
             # Discovery hashes every model and archives every custom node
             # package before the version call. A publish that can never succeed
-            # must not cost the author that, so an unusable alternative is
+            # must not cost the author that, so an unusable variation is
             # refused here — before a job exists and before a byte is read.
             raise web.HTTPBadRequest(text=str(error)) from error
+        idempotency_key = str(body.get("idempotency_key") or "").strip()
+        running = _running_job_for(idempotency_key)
+        if running is not None:
+            _job_log(
+                running,
+                "A second publish of this graph joined the job already running.",
+            )
+            return web.json_response(running, status=202)
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
             "job_id": job_id,
+            "idempotency_key": idempotency_key or None,
             "status": "queued",
             "progress": 0,
             "message": "Waiting to start…",
@@ -1408,8 +1656,25 @@ def register_routes() -> None:
             "logs": [],
         }
         _job_log(_jobs[job_id], "Publish job queued.")
-        asyncio.create_task(_run_publish(job_id, body, alternative))
+        _job_tasks[job_id] = asyncio.create_task(_run_publish(job_id, body, variation))
         return web.json_response(_jobs[job_id], status=202)
+
+    @routes.delete("/phantom-publisher/jobs/{job_id}")
+    async def publish_cancel(request: web.Request) -> web.Response:
+        job = _jobs.get(request.match_info["job_id"])
+        if not job:
+            raise web.HTTPNotFound()
+        task = _job_tasks.get(job["job_id"])
+        if task is None or task.done():
+            # Already finished one way or another; nothing left to stop.
+            return web.json_response(job)
+        _job_log(job, "Cancel requested.")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return web.json_response(job)
 
     @routes.get("/phantom-publisher/jobs/{job_id}")
     async def publish_status(request: web.Request) -> web.Response:

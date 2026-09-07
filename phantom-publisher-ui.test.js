@@ -36,9 +36,9 @@ describe('Phantom publisher progress UI', () => {
     contains(js, 'dependencies processed');
     contains(js, 'Publish activity log');
     contains(js, 'updateLogRows(job.logs)');
-    contains(
+    matches(
       js,
-      'showProgress(job.job_id, config.console_origin, target.slug, idempotencyStorageKey)',
+      /showProgress\(\s*job\.job_id,\s*config\.console_origin,\s*target\.slug,\s*idempotencyStorageKey,\s*\)/,
     );
     contains(js, 'Phantom console origin');
     matches(js, /job\.status === 'failed'[\s\S]*?logDetails\.open = true/);
@@ -48,6 +48,32 @@ describe('Phantom publisher progress UI', () => {
     contains(css, "[data-level='error']");
     matches(css, /\.phantom-publisher-progress-dialog > \*\s*{\s*min-width: 0/);
     matches(css, /\.phantom-publisher-phase\s*{\s*overflow-wrap: anywhere/);
+  });
+});
+
+describe('Phantom publisher cancel', () => {
+  it('offers a Cancel that ends the server-side job, not just the panel', () => {
+    // Closing the overlay only stops the polling; the upload is a task of the
+    // ComfyUI server and keeps running. Cancel is the control that ends it.
+    contains(js, 'Cancel publish');
+    matches(js, /request\(`\/jobs\/\$\{jobId\}`, \{ method: 'DELETE' \}\)/);
+    contains(css, '.phantom-publisher-secondary');
+  });
+
+  it('shows the cancelled state, stops polling, and offers Close', () => {
+    matches(
+      js,
+      /job\.status === 'cancelled'[\s\S]*?phase\.textContent = 'Publish cancelled'[\s\S]*?finish\(\);\s*return job;/,
+    );
+    contains(js, "cancelled: 'Cancelled'");
+    contains(css, "[data-status='cancelled']");
+    // Every terminal state removes Cancel, offers Close, and hands the finished
+    // job back — the caller reads the variation Phantom assigned off it.
+    matches(js, /job\.status === 'failed'[\s\S]*?finish\(\);\s*return job;/);
+    matches(js, /job\.status === 'completed'[\s\S]*?finish\(\);\s*return job;/);
+    matches(js, /const finish = \(\) => \{\s*cancel\.remove\(\);/);
+    // A closed panel learns nothing; the publish carries on in the server.
+    contains(js, 'return null;');
   });
 });
 
@@ -91,10 +117,10 @@ describe('Phantom publisher target confirmation', () => {
     );
     matches(js, /select\.value = rememberedTarget\?\.workflow_id \|\| ''/);
     contains(js, 'Workflow in Phantom');
-    contains(js, 'Publishing will add a new version to the selected workflow');
+    contains(js, 'Publishing replaces the primary graph in a new version of the selected workflow');
     matches(
       js,
-      /submit\.textContent = publishingAlternative\s*\?\s*'Publish alternative graph'\s*:\s*publishingNewVersion\s*\?\s*'Publish new version'/,
+      /submit\.textContent = updating\s*\?\s*'Update variation'\s*:\s*publishingVariation\s*\?\s*'Publish new variation'\s*:\s*publishingNewVersion\s*\?\s*'Publish new version'/,
     );
     contains(js, 'nameField.hidden = publishingNewVersion');
     contains(js, 'slugField.hidden = publishingNewVersion');
@@ -110,30 +136,103 @@ describe('Phantom publisher target confirmation', () => {
   });
 });
 
-describe('Phantom publisher alternative graphs', () => {
-  it('offers to publish into an existing workflow as an alternative of its current version', () => {
-    contains(js, "new Option('New version of the primary graph', PUBLISH_AS_VERSION)");
-    contains(js, "new Option('Alternative graph of the current version', PUBLISH_AS_ALTERNATIVE)");
+describe('Phantom publisher variation graphs', () => {
+  it('offers the primary, each current variation by id, and a new variation', () => {
+    contains(js, "new Option('New version — replace the primary graph', PUBLISH_AS_VERSION)");
+    contains(js, "new Option('New variation of the current version', PUBLISH_AS_VARIATION)");
+    // One option per variation the target's current version carries, keyed
+    // by id so the server replaces THAT graph rather than matching a label.
+    matches(
+      js,
+      /new Option\(\s*`Update variation: \$\{variation\.label\}`,\s*updateVariationValue\(variation\.variation_id\),?\s*\)/,
+    );
+    contains(js, "const UPDATE_VARIATION_PREFIX = 'variation:'");
     contains(js, 'publishAsField.hidden = !publishingNewVersion');
-    matches(js, /submit\.textContent = publishingAlternative\s*\?\s*'Publish alternative graph'/);
+    contains(js, 'heading.textContent = updating\n      ? `Update variation "${updating.label}"`');
     contains(
       js,
-      "joins the selected workflow's current version as an alternative, not as a new version",
+      "joins the selected workflow's current version as a variation, not as a new version",
+    );
+    contains(
+      js,
+      'Its conditions in the console are kept; its bindings are re-read from this graph.',
+    );
+  });
+
+  it('rebuilds the choices per workflow and prefills an update from the variation itself', () => {
+    // Each workflow has its own variations, so the select is rebuilt when the
+    // target changes, and an update starts from that variation's own text.
+    matches(js, /select\.addEventListener\('change', \(\) => \{\s*rebuildPublishAs\(\);/);
+    contains(js, 'publishAs.replaceChildren(...publishAsOptions(target))');
+    contains(js, "variationLabel.value = variation ? variation.label : remembers?.label || ''");
+    // The update resolves with the id beside the label, so the server can
+    // tell a replacement from a new variation.
+    contains(js, '...(updating ? { variation_id: updating.variation_id } : {})');
+  });
+
+  it('reopens on the remembered variation only while the target still has it', () => {
+    contains(js, 'const matched = rememberedMatch(target);');
+    matches(
+      js,
+      /publishAs\.value = matched\s*\? updateVariationValue\(matched\.variation_id\)\s*: rememberedFor\(target\)\s*\? PUBLISH_AS_VARIATION\s*: PUBLISH_AS_VERSION;/,
+    );
+  });
+
+  it('matches the remembered variation by id, and falls back to its label', () => {
+    // A graph carries no id when it was published by 0.6.0, or when the panel
+    // was closed before the publish finished. Matching the label is what stops
+    // the next publish adding a duplicate of a variation that already exists.
+    matches(
+      js,
+      /remembers\.variation_id &&\s*variations\.find\(\(v\) => v\.variation_id === remembers\.variation_id\)/,
+    );
+    contains(js, 'variations.find((v) => v.label === remembers.label)');
+  });
+
+  it('never carries the remembered variation to a different workflow', () => {
+    // Two workflows can label a variation the same way. Matching across them
+    // would send the other workflow's variation_id and replace a graph the
+    // author never chose, so pointing the graph elsewhere drops the block —
+    // for the matching, for the default choice, and for the prefilled label.
+    contains(
+      js,
+      'const rememberedFor = (target) =>\n' +
+        '    target && target.workflow_id === remembered ? rememberedVariation : null;',
+    );
+    contains(js, 'const remembers = rememberedFor(target);');
+    excludes(js, 'rememberedVariation?.label');
+    excludes(js, 'rememberedVariation?.description');
+  });
+
+  it('reads the block 0.6.0 wrote and republishes it in the variation shape', () => {
+    // 0.6.0 called it `alternative`. Without the fallback the dialog opens such
+    // a graph on the primary, so the next publish replaces the primary graph.
+    contains(js, 'phantom.variation || phantom.alternative || null');
+    contains(js, 'chooseTarget(phantom.workflow_id, config, rememberedVariation)');
+  });
+
+  it('writes the variation id Phantom assigned back into the graph', () => {
+    // A new variation only learns its id from the publish that created it.
+    // Without writing it back, the next publish of the same file cannot match
+    // the graph to that variation and adds a second one instead.
+    contains(js, 'finished?.variation?.variation_id && graphExtra.phantom.variation');
+    contains(
+      js,
+      'graphExtra.phantom.variation = { ...graphExtra.phantom.variation, ...finished.variation };',
     );
   });
 
   it('requires the label — it is the only moment the author knows when the graph applies', () => {
     contains(js, 'When should Phantom use this graph?');
-    contains(js, 'alternativeLabelField.hidden = !publishingAlternative');
-    matches(js, /if \(!label\) \{[\s\S]*?the label is required for an alternative/);
-    contains(js, 'alternativeLabel.focus()');
+    contains(js, 'variationLabelField.hidden = !publishingVariation');
+    matches(js, /if \(!label\) \{[\s\S]*?the label is required for a variation/);
+    contains(js, 'variationLabel.focus()');
     // The block travels beside the graph, and the server refuses it blank too.
-    contains(js, '...(target.alternative ? { alternative: target.alternative } : {})');
+    contains(js, '...(target.variation ? { variation: target.variation } : {})');
   });
 
   it('remembers the label in the graph so a republish opens on it, and never sends a dead mapping', () => {
-    contains(js, 'chooseTarget(phantom.workflow_id, config, phantom.alternative || null)');
-    contains(js, "alternativeLabel.value = rememberedAlternative?.label || ''");
+    contains(js, "remembers?.label || ''");
     // `graphExtra.phantom` is overwritten just before the prompt is read, so a
     // mapping read off it was always undefined. Nothing reads it now.
     excludes(js, 'interface_mapping');

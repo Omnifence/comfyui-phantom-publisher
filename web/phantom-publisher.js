@@ -103,13 +103,33 @@ const configure = (current = {}) =>
 // restarts the publish against whichever Phantom they end up connected to.
 const RECONFIGURE = Symbol('reconfigure');
 
-// How a graph joins an existing workflow: as its next primary version, or as
-// an ALTERNATIVE graph of the current version that Phantom runs instead of the
-// primary when the caller's inputs meet the conditions set in the console.
+// How a graph joins an existing workflow: as its next primary version, as a
+// NEW variation graph of the current version that Phantom runs instead of the
+// primary when the caller's inputs meet the conditions set in the console, or
+// as the replacement of a variation the current version already has.
 const PUBLISH_AS_VERSION = 'version';
-const PUBLISH_AS_ALTERNATIVE = 'alternative';
+const PUBLISH_AS_VARIATION = 'variation';
+const UPDATE_VARIATION_PREFIX = 'variation:';
+const updateVariationValue = (variationId) => `${UPDATE_VARIATION_PREFIX}${variationId}`;
+const updatedVariationId = (value) =>
+  value.startsWith(UPDATE_VARIATION_PREFIX) ? value.slice(UPDATE_VARIATION_PREFIX.length) : null;
 
-const chooseTarget = async (remembered, config = {}, rememberedAlternative = null) => {
+// The "Publish as" choices for one target: the primary, each of its current
+// variations by id, and a new variation. Names are stored text, so options are
+// built as elements — see the workflow select below.
+const publishAsOptions = (target) => [
+  new Option('New version — replace the primary graph', PUBLISH_AS_VERSION),
+  ...(target?.variations || []).map(
+    (variation) =>
+      new Option(
+        `Update variation: ${variation.label}`,
+        updateVariationValue(variation.variation_id),
+      ),
+  ),
+  new Option('New variation of the current version', PUBLISH_AS_VARIATION),
+];
+
+const chooseTarget = async (remembered, config = {}, rememberedVariation = null) => {
   const data = await request('/targets');
   const rememberedTarget = data.targets.find((target) => target.workflow_id === remembered);
   const modal = dialog();
@@ -131,24 +151,69 @@ const chooseTarget = async (remembered, config = {}, rememberedAlternative = nul
   const provider = document.createElement('select');
   provider.innerHTML = `<option value="runpod">RunPod</option><option value="vast-ai">Vast AI</option>`;
   const publishAs = document.createElement('select');
-  publishAs.replaceChildren(
-    new Option('New version of the primary graph', PUBLISH_AS_VERSION),
-    new Option('Alternative graph of the current version', PUBLISH_AS_ALTERNATIVE),
-  );
-  publishAs.value = rememberedAlternative ? PUBLISH_AS_ALTERNATIVE : PUBLISH_AS_VERSION;
   // The label is the one thing only the author knows, and only now: it tells
   // whoever configures the conditions in Phantom WHEN this graph should run.
-  const alternativeLabel = input('e.g. Caller sends a reference image');
-  alternativeLabel.maxLength = 120;
-  alternativeLabel.value = rememberedAlternative?.label || '';
-  const alternativeDescription = input('Optional — what this graph does differently');
-  alternativeDescription.value = rememberedAlternative?.description || '';
+  const variationLabel = input('e.g. Caller sends a reference image');
+  variationLabel.maxLength = 120;
+  const variationDescription = input('Optional — what this graph does differently');
+  const selectedVariation = () => {
+    const target = data.targets.find((candidate) => candidate.workflow_id === select.value);
+    const id = updatedVariationId(publishAs.value);
+    return id ? (target?.variations || []).find((v) => v.variation_id === id) || null : null;
+  };
+  // The remembered block belongs to ONE workflow. Pointing the graph at a
+  // different one drops it: two workflows can label a variation the same way,
+  // and matching across them would send the other workflow's variation_id and
+  // replace a graph the author never chose.
+  const rememberedFor = (target) =>
+    target && target.workflow_id === remembered ? rememberedVariation : null;
+  // The variation that block names, by id and then by label. The label fallback
+  // is what a graph published before the id came back carries — a 0.6.0 graph,
+  // or one whose panel was closed before the publish finished — and matching it
+  // is what stops the next publish adding a duplicate.
+  const rememberedMatch = (target) => {
+    const remembers = rememberedFor(target);
+    if (!remembers) return null;
+    const variations = target?.variations || [];
+    return (
+      (remembers.variation_id &&
+        variations.find((v) => v.variation_id === remembers.variation_id)) ||
+      (remembers.label && variations.find((v) => v.label === remembers.label)) ||
+      null
+    );
+  };
+  // Rebuilt per target: each workflow has its own variations. The remembered
+  // choice is kept when the target still offers it — an update of a variation
+  // that has since been removed falls back to publishing a new one under the
+  // remembered label.
+  const rebuildPublishAs = () => {
+    const target = data.targets.find((candidate) => candidate.workflow_id === select.value);
+    publishAs.replaceChildren(...publishAsOptions(target));
+    const matched = rememberedMatch(target);
+    publishAs.value = matched
+      ? updateVariationValue(matched.variation_id)
+      : rememberedFor(target)
+        ? PUBLISH_AS_VARIATION
+        : PUBLISH_AS_VERSION;
+    prefillVariationFields();
+  };
+  // An update starts from the variation's own label and description; a new
+  // variation from whatever was remembered from the last publish.
+  const prefillVariationFields = () => {
+    const target = data.targets.find((candidate) => candidate.workflow_id === select.value);
+    const remembers = rememberedFor(target);
+    const variation = selectedVariation();
+    variationLabel.value = variation ? variation.label : remembers?.label || '';
+    variationDescription.value = variation
+      ? variation.description || ''
+      : remembers?.description || '';
+  };
   const nameField = field('Name', name);
   const slugField = field('Slug', slug);
   const providerField = field('Provider', provider);
   const publishAsField = field('Publish as', publishAs);
-  const alternativeLabelField = field('When should Phantom use this graph?', alternativeLabel);
-  const alternativeDescriptionField = field('Description', alternativeDescription);
+  const variationLabelField = field('When should Phantom use this graph?', variationLabel);
+  const variationDescriptionField = field('Description', variationDescription);
   const submit = document.createElement('button');
   submit.className = 'phantom-publisher-primary';
   const status = document.createElement('p');
@@ -156,34 +221,48 @@ const chooseTarget = async (remembered, config = {}, rememberedAlternative = nul
   const updateTargetConfirmation = () => {
     const selectedTarget = data.targets.find((target) => target.workflow_id === select.value);
     const publishingNewVersion = Boolean(selectedTarget);
-    const publishingAlternative =
-      publishingNewVersion && publishAs.value === PUBLISH_AS_ALTERNATIVE;
+    const updating = publishingNewVersion ? selectedVariation() : null;
+    const publishingVariation =
+      publishingNewVersion && (Boolean(updating) || publishAs.value === PUBLISH_AS_VARIATION);
     // The new-target fields are only HIDDEN below, never cleared, so switching
     // back to "new workflow" finds whatever the user typed still in them.
-    heading.textContent = publishingAlternative
-      ? 'Publish alternative graph'
-      : publishingNewVersion
-        ? 'Publish new workflow version'
-        : 'Publish workflow';
-    help.textContent = publishingAlternative
-      ? "This graph joins the selected workflow's current version as an alternative, not as a new version of the workflow. Phantom runs it instead of the primary graph when the conditions set in the console hold — the label below says when."
-      : publishingNewVersion
-        ? 'Confirm the destination in Phantom. Publishing will add a new version to the selected workflow; existing versions will remain unchanged.'
-        : 'Create a new workflow in Phantom and publish its first version.';
-    submit.textContent = publishingAlternative
-      ? 'Publish alternative graph'
-      : publishingNewVersion
-        ? 'Publish new version'
-        : 'Create and publish';
+    heading.textContent = updating
+      ? `Update variation "${updating.label}"`
+      : publishingVariation
+        ? 'Publish new variation'
+        : publishingNewVersion
+          ? 'Publish new workflow version'
+          : 'Publish workflow';
+    help.textContent = updating
+      ? `This graph replaces the "${updating.label}" variation on the selected workflow's current version. Its conditions in the console are kept; its bindings are re-read from this graph. Every version keeps every variation, so this lands as a new version too.`
+      : publishingVariation
+        ? "This graph joins the selected workflow's current version as a variation, not as a new version of the workflow. Phantom runs it instead of the primary graph when the conditions set in the console hold — the label below says when."
+        : publishingNewVersion
+          ? 'Confirm the destination in Phantom. Publishing replaces the primary graph in a new version of the selected workflow; its variations carry forward, and existing versions remain unchanged.'
+          : 'Create a new workflow in Phantom and publish its first version.';
+    submit.textContent = updating
+      ? 'Update variation'
+      : publishingVariation
+        ? 'Publish new variation'
+        : publishingNewVersion
+          ? 'Publish new version'
+          : 'Create and publish';
     nameField.hidden = publishingNewVersion;
     slugField.hidden = publishingNewVersion;
     providerField.hidden = publishingNewVersion;
     publishAsField.hidden = !publishingNewVersion;
-    alternativeLabelField.hidden = !publishingAlternative;
-    alternativeDescriptionField.hidden = !publishingAlternative;
+    variationLabelField.hidden = !publishingVariation;
+    variationDescriptionField.hidden = !publishingVariation;
   };
-  select.addEventListener('change', updateTargetConfirmation);
-  publishAs.addEventListener('change', updateTargetConfirmation);
+  select.addEventListener('change', () => {
+    rebuildPublishAs();
+    updateTargetConfirmation();
+  });
+  publishAs.addEventListener('change', () => {
+    prefillVariationFields();
+    updateTargetConfirmation();
+  });
+  rebuildPublishAs();
   updateTargetConfirmation();
 
   return new Promise((resolve, reject) => {
@@ -191,21 +270,23 @@ const chooseTarget = async (remembered, config = {}, rememberedAlternative = nul
       try {
         if (select.value) {
           const selected = data.targets.find((target) => target.workflow_id === select.value);
-          if (publishAs.value === PUBLISH_AS_ALTERNATIVE) {
-            const label = alternativeLabel.value.trim();
+          const updating = selectedVariation();
+          if (updating || publishAs.value === PUBLISH_AS_VARIATION) {
+            const label = variationLabel.value.trim();
             if (!label) {
               status.textContent =
-                'Say when Phantom should use this graph — the label is required for an alternative.';
-              alternativeLabel.focus();
+                'Say when Phantom should use this graph — the label is required for a variation.';
+              variationLabel.focus();
               return;
             }
             modal.close();
             resolve({
               ...selected,
-              alternative: {
+              variation: {
+                ...(updating ? { variation_id: updating.variation_id } : {}),
                 label,
-                ...(alternativeDescription.value.trim()
-                  ? { description: alternativeDescription.value.trim() }
+                ...(variationDescription.value.trim()
+                  ? { description: variationDescription.value.trim() }
                   : {}),
               },
             });
@@ -251,8 +332,8 @@ const chooseTarget = async (remembered, config = {}, rememberedAlternative = nul
       slugField,
       providerField,
       publishAsField,
-      alternativeLabelField,
-      alternativeDescriptionField,
+      variationLabelField,
+      variationDescriptionField,
       submit,
       status,
       connection,
@@ -277,6 +358,7 @@ const dependencyStatus = {
   reused: 'Already in Phantom',
   not_required: 'No upload needed',
   failed: 'Failed',
+  cancelled: 'Cancelled',
 };
 
 const dependencyKind = {
@@ -293,6 +375,7 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
       <div>
         <h2>Publishing to Phantom</h2>
         <p class="phantom-publisher-phase" aria-live="polite">Preparing manifest…</p>
+        <button type="button" class="phantom-publisher-secondary phantom-publisher-cancel">Cancel publish</button>
       </div>
       <strong class="phantom-publisher-progress-value">0%</strong>
     </div>
@@ -315,9 +398,35 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
   const logDetails = modal.panel.querySelector('.phantom-publisher-log');
   const logCount = modal.panel.querySelector('.phantom-publisher-log-count');
   const logList = modal.panel.querySelector('.phantom-publisher-log-list');
+  const cancel = modal.panel.querySelector('.phantom-publisher-cancel');
   const dependencyRows = new Map();
   const logRows = new Map();
   let currentDependencyId = null;
+
+  // Closing the panel stops nothing — the publish is a task of the ComfyUI
+  // server, and the tab only watches it. Cancel is the one control that ends
+  // the transfer, so it stays visible until the job has finished either way.
+  cancel.onclick = async () => {
+    cancel.disabled = true;
+    cancel.textContent = 'Cancelling…';
+    try {
+      await request(`/jobs/${jobId}`, { method: 'DELETE' });
+    } catch (error) {
+      cancel.disabled = false;
+      cancel.textContent = 'Cancel publish';
+      phase.textContent = `Could not cancel: ${error.message}`;
+    }
+  };
+
+  const finish = () => {
+    cancel.remove();
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'phantom-publisher-secondary';
+    close.textContent = 'Close';
+    close.onclick = () => modal.close();
+    modal.panel.append(close);
+  };
 
   const updateDependencyRows = (dependencies = []) => {
     empty.hidden = dependencies.length > 0;
@@ -436,7 +545,20 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
       progressValue.classList.add('phantom-publisher-error');
       logDetails.open = true;
       logList.scrollTop = logList.scrollHeight;
-      return;
+      finish();
+      return job;
+    }
+    if (job.status === 'cancelled') {
+      // The idempotency key stays: a retry of this exact payload resumes the
+      // version the cancelled publish staged instead of creating another.
+      phase.textContent = 'Publish cancelled';
+      phase.classList.add('phantom-publisher-muted');
+      progressValue.classList.add('phantom-publisher-muted');
+      progress.classList.add('phantom-publisher-muted');
+      logDetails.open = true;
+      logList.scrollTop = logList.scrollHeight;
+      finish();
+      return job;
     }
     if (job.status === 'completed') {
       localStorage.removeItem(idempotencyStorageKey);
@@ -451,10 +573,14 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
           'noopener',
         );
       modal.panel.append(open);
-      return;
+      finish();
+      return job;
     }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+  // The panel was closed. The publish carries on in the ComfyUI server, and
+  // nothing here learns how it ended.
+  return null;
 };
 
 const publish = async () => {
@@ -466,7 +592,12 @@ const publish = async () => {
     }
     const graphExtra = app.graph.extra || (app.graph.extra = {});
     const phantom = graphExtra.phantom || {};
-    const target = await chooseTarget(phantom.workflow_id, config, phantom.alternative || null);
+    // 0.6.0 wrote the block as `alternative`, so a graph saved by that version
+    // is read here and written back below in the `variation` shape. Without the
+    // fallback the dialog would open such a graph on the primary and the next
+    // publish would replace the primary graph instead of the variation.
+    const rememberedVariation = phantom.variation || phantom.alternative || null;
+    const target = await chooseTarget(phantom.workflow_id, config, rememberedVariation);
     if (target === RECONFIGURE) {
       // The target list belongs to the old Phantom, so re-enter from the top
       // rather than reusing anything read before the switch. A dismissed
@@ -475,11 +606,11 @@ const publish = async () => {
       return;
     }
     // Remembered in the graph so the next publish of this file opens on the
-    // same target — and, for an alternative, on the same label.
+    // same target — and, for a variation, on the same label.
     graphExtra.phantom = {
       origin: config.origin,
       workflow_id: target.workflow_id,
-      ...(target.alternative ? { alternative: target.alternative } : {}),
+      ...(target.variation ? { variation: target.variation } : {}),
     };
     const refreshed = await app.graphToPrompt();
     const idempotencyStorageKey = `phantom-publisher:${target.workflow_id}:pending`;
@@ -487,7 +618,7 @@ const publish = async () => {
       workflow_id: target.workflow_id,
       api_workflow: refreshed.output,
       ui_workflow: refreshed.workflow,
-      ...(target.alternative ? { alternative: target.alternative } : {}),
+      ...(target.variation ? { variation: target.variation } : {}),
     };
     const manifestFingerprint = await fingerprintPublishPayload(publishPayload);
     const idempotencyKey = selectPendingIdempotencyKey(
@@ -505,7 +636,18 @@ const publish = async () => {
         idempotency_key: idempotencyKey,
       }),
     });
-    await showProgress(job.job_id, config.console_origin, target.slug, idempotencyStorageKey);
+    const finished = await showProgress(
+      job.job_id,
+      config.console_origin,
+      target.slug,
+      idempotencyStorageKey,
+    );
+    // Phantom assigns the variation id, and a new variation only learns its own
+    // here. Written back so the next publish of this file updates that graph
+    // instead of adding another variation beside it.
+    if (finished?.variation?.variation_id && graphExtra.phantom.variation) {
+      graphExtra.phantom.variation = { ...graphExtra.phantom.variation, ...finished.variation };
+    }
   } catch (error) {
     const modal = dialog();
     modal.panel.innerHTML = `<h2>Publish failed</h2><p class="phantom-publisher-error"></p>`;
