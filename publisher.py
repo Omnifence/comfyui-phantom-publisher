@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.8.0"
+PUBLISHER_VERSION = "0.9.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -734,7 +735,34 @@ async def _target_runtime(
     return None
 
 
-def _pip_dependencies(directory: Path) -> list[str]:
+# Modules whose import is ComfyUI itself, never a distribution to install.
+_COMFYUI_MODULES = frozenset(
+    {
+        "comfy",
+        "comfy_extras",
+        "folder_paths",
+        "nodes",
+        "server",
+        "app",
+        "utils",
+        "execution",
+        "latent_preview",
+        "comfy_api",
+        "comfy_api_nodes",
+        "comfy_config",
+        "comfy_execution",
+        "comfyui_version",
+    }
+)
+
+
+def _pip_dependencies(
+    directory: Path,
+    traced_modules: set[str] | None = None,
+    *,
+    module_to_distributions: dict[str, list[str]] | None = None,
+    provided: set[str] | None = None,
+) -> list[str]:
     """
     The installed distributions this node package imports, version-pinned.
 
@@ -744,18 +772,31 @@ def _pip_dependencies(directory: Path) -> list[str]:
     cleanly, fails to import at ComfyUI startup, and silently registers none of
     its node classes. Every render against that image then fails with a ComfyUI
     400 "custom node may not be installed".
+
+    Two sources of module names, unioned: the package's `.py` sources, parsed
+    statically, and `traced_modules`, what a real load of the package imported
+    (`_trace_imports`). Static parsing cannot see an import made inside a
+    compiled extension, a lazy `importlib.import_module(...)`, or C code — the
+    DiffusionWave packs import `imageio` from inside a Nuitka binary — so the
+    trace is what makes the capture complete. `module_to_distributions` and
+    `provided` are hoisted by a caller capturing several packages, because
+    computing them is a walk over site-packages.
     """
     stdlib = set(sys.builtin_module_names) | set(sys.stdlib_module_names)
-    ignored = stdlib | _local_module_names(directory) | {"comfy", "comfy_extras", "folder_paths", "nodes", "server", "app", "utils", "execution", "latent_preview", "comfy_api", "comfy_api_nodes"}
-    provided = _comfyui_provided_distributions() | _declared_requirements(directory)
+    ignored = stdlib | _local_module_names(directory) | _COMFYUI_MODULES
+    if provided is None:
+        provided = _comfyui_provided_distributions()
+    provided = provided | _declared_requirements(directory)
 
-    try:
-        module_to_distributions = importlib.metadata.packages_distributions()
-    except Exception:
-        return []
+    if module_to_distributions is None:
+        try:
+            module_to_distributions = importlib.metadata.packages_distributions()
+        except Exception:
+            return []
 
+    modules = _imported_top_level_modules(directory) | set(traced_modules or ())
     pinned: dict[str, str] = {}
-    for module in sorted(_imported_top_level_modules(directory) - ignored):
+    for module in sorted(modules - ignored):
         for distribution in module_to_distributions.get(module, []):
             normalized = _normalize_distribution(distribution)
             if normalized in provided or normalized in pinned:
@@ -766,6 +807,280 @@ def _pip_dependencies(directory: Path) -> list[str]:
                 continue
             pinned[normalized] = f"{distribution}=={version}"
     return sorted(pinned.values())
+
+
+def _environment_lock() -> dict[str, Any]:
+    """
+    The publishing venv, as a lock Phantom can heal a build from.
+
+    `distributions` is every installed distribution at its exact version, and
+    `modules` maps each importable top-level module to the distribution(s) that
+    provide it — `cv2` names every opencv variant the venv holds, so a heal
+    installs the same set the publisher's own pin rule would have. Names are
+    normalised the way pip compares them, and every module value names a key
+    in `distributions`, so a heal never resolves to a version it cannot find.
+
+    Static and runtime capture both attribute imports made while a package
+    LOADS. An import a node makes only while a workflow executes reaches
+    neither, and the lock is what lets the build resolve such a module when
+    the class check surfaces it, instead of failing on a guess.
+    """
+    distributions: dict[str, str] = {}
+    try:
+        for distribution in importlib.metadata.distributions():
+            metadata = distribution.metadata
+            name = metadata["Name"] if metadata is not None else None
+            version = distribution.version
+            if isinstance(name, str) and name and isinstance(version, str) and version:
+                distributions.setdefault(_normalize_distribution(name), version)
+        module_to_distributions = importlib.metadata.packages_distributions()
+    except Exception:
+        return {"distributions": {}, "modules": {}}
+    modules: dict[str, list[str]] = {}
+    for module, names in module_to_distributions.items():
+        known = sorted({_normalize_distribution(name) for name in names} & set(distributions))
+        if known:
+            modules[module] = known
+    return {
+        "distributions": dict(sorted(distributions.items())),
+        "modules": dict(sorted(modules.items())),
+    }
+
+
+# One ComfyUI import per pack costs about 10–20 s. A pack that has not
+# finished loading in three minutes is hung, not slow.
+_TRACE_TIMEOUT_SECONDS = 180
+# How much of the subprocess log a failure report keeps.
+_TRACE_LOG_TAIL_BYTES = 4000
+
+# Runs in a FRESH interpreter, one per package, so the `sys.modules` diff is
+# exact for everything the package imports that the ComfyUI baseline did not,
+# however the import was made. Two hooks cover the case the diff cannot — a
+# module the baseline already loaded: `builtins.__import__` (the IMPORT_NAME
+# bytecode and PyImport_Import both go through it, cached or not, including
+# from compiled code) and `importlib.import_module` (which bypasses
+# `builtins.__import__` and returns a cached module with no `sys.modules`
+# change — CPython issue 18831).
+#
+# argv: result path, package path. The result goes to a FILE, never stdout:
+# imported packages print freely at import time, and a pipe would both corrupt
+# the JSON and risk a deadlock on a full buffer.
+_TRACE_SCRIPT = r'''
+import builtins
+import importlib
+import importlib.util
+import json
+import os
+import sys
+import traceback
+
+result_path, package_path = sys.argv[1], sys.argv[2]
+# ComfyUI parses argv only when main.py enables it, but nothing else here
+# should see the trace arguments either.
+del sys.argv[1:]
+
+recorded = set()
+_import = builtins.__import__
+_import_module = importlib.import_module
+
+
+def _record(name):
+    if isinstance(name, str) and name and not name.startswith("."):
+        recorded.add(name.split(".", 1)[0])
+
+
+def _hooked_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if level == 0:
+        _record(name)
+    return _import(name, globals, locals, fromlist, level)
+
+
+def _hooked_import_module(name, package=None):
+    _record(name)
+    return _import_module(name, package)
+
+
+def _format(exc):
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return text[-4000:]
+
+
+modules = set()
+error = None
+try:
+    sys.path.insert(0, os.getcwd())
+    from comfy.cli_args import args
+
+    # The publishing machine may run headless; the build's class check does
+    # the same, and node registration is import work either way.
+    args.cpu = True
+    try:
+        import utils.extra_config  # noqa: F401
+    except ImportError:
+        pass
+    import nodes  # noqa: F401
+
+    baseline = set(sys.modules)
+    builtins.__import__ = _hooked_import
+    importlib.import_module = _hooked_import_module
+    recorded.clear()
+    try:
+        # Mirror nodes.load_custom_node: a directory loads through its
+        # __init__.py under a path-derived module name, a file under its stem.
+        if os.path.isfile(package_path):
+            module_name = os.path.splitext(package_path)[0]
+            location = package_path
+        else:
+            module_name = package_path.replace(".", "_x_")
+            location = os.path.join(package_path, "__init__.py")
+        spec = importlib.util.spec_from_file_location(module_name, location)
+        if spec is None or spec.loader is None:
+            raise ImportError("No loadable module at " + location)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    except BaseException as exc:  # every failure is a finding, not a crash
+        failure = exc
+    else:
+        failure = None
+    finally:
+        builtins.__import__ = _import
+        importlib.import_module = _import_module
+    if failure is not None:
+        # Formatting a traceback imports lazily; the hooks are already off.
+        error = _format(failure)
+    else:
+        modules = {name.split(".", 1)[0] for name in set(sys.modules) - baseline} | recorded
+        # The package's own module name is a path, not a distribution.
+        modules.discard(module_name)
+        modules.discard(module_name.split(".", 1)[0])
+except BaseException as exc:
+    error = _format(exc)
+
+with open(result_path, "w", encoding="utf-8") as handle:
+    json.dump({"modules": sorted(modules) if error is None else [], "error": error}, handle)
+'''
+
+
+class TraceResult:
+    """What a runtime load of one package imported, or why it could not be traced."""
+
+    __slots__ = ("modules", "error")
+
+    def __init__(self, modules: set[str], error: str | None) -> None:
+        self.modules = modules
+        self.error = error
+
+
+def _log_tail(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return data[-_TRACE_LOG_TAIL_BYTES:].decode("utf-8", errors="replace").strip()
+
+
+def _last_line(text: str) -> str:
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    return lines[-1].strip() if lines else ""
+
+
+def _trace_log_line(package: dict[str, Any]) -> tuple[str, str]:
+    """One job-log line per package: how its dependencies were captured."""
+    name = Path(package.get("_package_directory") or "package").name
+    capture = package.get("dependency_capture") or {}
+    seconds = float(package.get("_trace_seconds") or 0.0)
+    if capture.get("method") == "runtime":
+        count = int(package.get("_trace_module_count") or 0)
+        return (f"Traced imports of {name} ({count} modules, {seconds:.1f} s)", "info")
+    reason = _last_line(str(capture.get("error") or ""))
+    return (
+        f"Could not trace imports of {name}; its dependencies were captured statically instead"
+        + (f": {reason}" if reason else ""),
+        "warning",
+    )
+
+
+def _kill(process: "subprocess.Popen[bytes]") -> None:
+    with contextlib.suppress(OSError):
+        process.kill()
+    with contextlib.suppress(Exception):
+        process.wait(timeout=5)
+
+
+def _trace_imports(
+    directory: Path,
+    comfy_root: Path,
+    cancellation: threading.Event | None = None,
+) -> TraceResult:
+    """
+    Load `directory` the way ComfyUI does, in a fresh interpreter, and report
+    what it imported. `sys.executable` is the ComfyUI venv's Python in every
+    install shape, Desktop included; `comfy_root` is the directory holding
+    `nodes.py` (`_comfy_source_root`, never `folder_paths.base_path`).
+
+    A failure of any kind — non-zero exit, timeout, unreadable result — is a
+    result with no modules and an error, so the caller falls back to static
+    capture and says so. A cancel kills the child and raises
+    `_DiscoveryCancelled`, which the discovery reap path already handles.
+    """
+    with tempfile.TemporaryDirectory(prefix="phantom-trace-") as temporary:
+        result_path = Path(temporary) / "result.json"
+        log_path = Path(temporary) / "log.txt"
+        with log_path.open("wb") as log:
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, "-", str(result_path), str(directory)],
+                    cwd=str(comfy_root),
+                    stdin=subprocess.PIPE,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+            except OSError as exc:
+                return TraceResult(set(), f"Could not start the trace interpreter: {exc}")
+            try:
+                assert process.stdin is not None
+                with contextlib.suppress(OSError):
+                    process.stdin.write(_TRACE_SCRIPT.encode("utf-8"))
+                    process.stdin.close()
+                deadline = time.monotonic() + _TRACE_TIMEOUT_SECONDS
+                while process.poll() is None:
+                    if cancellation is not None and cancellation.is_set():
+                        _kill(process)
+                        raise _DiscoveryCancelled("The publish was cancelled during discovery")
+                    if time.monotonic() >= deadline:
+                        _kill(process)
+                        return TraceResult(
+                            set(),
+                            f"Import trace timed out after {_TRACE_TIMEOUT_SECONDS}s. "
+                            + _log_tail(log_path),
+                        )
+                    if cancellation is not None:
+                        cancellation.wait(0.25)
+                    else:
+                        time.sleep(0.25)
+            finally:
+                if process.poll() is None:
+                    _kill(process)
+        if process.returncode != 0:
+            return TraceResult(
+                set(),
+                f"Trace interpreter exited with {process.returncode}. " + _log_tail(log_path),
+            )
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            modules = payload.get("modules")
+            error = payload.get("error")
+            if not isinstance(modules, list):
+                raise ValueError("modules is not a list")
+        except (OSError, ValueError, AttributeError) as exc:
+            return TraceResult(
+                set(), f"Trace wrote no readable result ({exc}). " + _log_tail(log_path)
+            )
+        return TraceResult(
+            {name for name in modules if isinstance(name, str)},
+            error if isinstance(error, str) and error else None,
+        )
 
 
 def _archive_package(
@@ -1081,7 +1396,20 @@ def _archive_grouped_packages(
 
     A generator so a cancelled or failed run still hands its caller everything
     written up to that point, which is what has to be deleted.
+
+    Each package is loaded once in a fresh interpreter first (`_trace_imports`)
+    so its dependency capture is what it really imports, not what its sources
+    happen to spell out. A trace that fails falls back to static capture and
+    says so in the package's `dependency_capture`; `_trace_log_line` turns
+    that into the job's log entry.
     """
+    comfy_root = _comfy_source_root()
+    provided = _comfyui_provided_distributions()
+    try:
+        module_to_distributions = importlib.metadata.packages_distributions()
+    except Exception:
+        module_to_distributions = {}
+
     for directory_key in sorted(grouped):
         _stop_if_cancelled(cancellation)
         entry = grouped[directory_key]
@@ -1090,11 +1418,24 @@ def _archive_grouped_packages(
         # resolved directory; a disagreeing label never names the directory and
         # never rides along as provenance either.
         cnr_id, version = next(iter(entry["labels"]), (None, None))
+        started = time.monotonic()
+        trace = _trace_imports(directory, comfy_root, cancellation)
         package: dict[str, Any] = {
             "class_types": sorted(entry["classes"]),
             "cnr_id": cnr_id,
             "version": version,
-            "pip_dependencies": _pip_dependencies(directory),
+            "pip_dependencies": _pip_dependencies(
+                directory,
+                trace.modules if trace.error is None else None,
+                module_to_distributions=module_to_distributions,
+                provided=provided,
+            ),
+            "dependency_capture": {
+                "method": "runtime" if trace.error is None else "static",
+                "error": trace.error,
+            },
+            "_trace_seconds": time.monotonic() - started,
+            "_trace_module_count": len(trace.modules),
             "compiled_extensions": _compiled_extensions(directory),
             **_git_metadata(directory),
             "archive_sha256": None,
@@ -1573,6 +1914,10 @@ async def _run_publish(
             ui_workflow,
             archives=_package_archives,
         )
+        for package in packages:
+            if isinstance(package.get("dependency_capture"), dict):
+                message, level = _trace_log_line(package)
+                _job_log(job, message, level=level)
 
         def report_external_repository(repo_id: str, index: int, total: int) -> None:
             _job_step(
@@ -1653,6 +1998,7 @@ async def _run_publish(
                 "frontend_version": None,
                 "publisher_version": PUBLISHER_VERSION,
                 "runtime": runtime,
+                "environment": _environment_lock(),
             },
             "workflow": {"api": api_workflow, "ui": ui_workflow},
             "node_packages": [
