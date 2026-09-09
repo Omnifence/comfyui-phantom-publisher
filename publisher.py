@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -827,15 +828,24 @@ def _environment_lock() -> dict[str, Any]:
     """
     distributions: dict[str, str] = {}
     try:
-        for distribution in importlib.metadata.distributions():
+        installed = list(importlib.metadata.distributions())
+    except Exception:
+        installed = []
+    for distribution in installed:
+        # One distribution with unreadable metadata — a `.dist-info` an
+        # interrupted install left half-written — must not empty the lock.
+        try:
             metadata = distribution.metadata
             name = metadata["Name"] if metadata is not None else None
             version = distribution.version
-            if isinstance(name, str) and name and isinstance(version, str) and version:
-                distributions.setdefault(_normalize_distribution(name), version)
+        except Exception:
+            continue
+        if isinstance(name, str) and name and isinstance(version, str) and version:
+            distributions.setdefault(_normalize_distribution(name), version)
+    try:
         module_to_distributions = importlib.metadata.packages_distributions()
     except Exception:
-        return {"distributions": {}, "modules": {}}
+        module_to_distributions = {}
     modules: dict[str, list[str]] = {}
     for module, names in module_to_distributions.items():
         known = sorted({_normalize_distribution(name) for name in names} & set(distributions))
@@ -920,6 +930,22 @@ try:
         pass
     import nodes  # noqa: F401
 
+    # Many packs register HTTP routes at import through
+    # `PromptServer.instance.routes`. ComfyUI constructs the server before it
+    # loads any custom node, so the trace does the same — on its own loop,
+    # the way main.py does.
+    try:
+        import asyncio
+
+        import server
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        server.PromptServer(loop)
+    except Exception:
+        # A ComfyUI without a constructible server: the pack decides.
+        traceback.print_exc()
+
     baseline = set(sys.modules)
     builtins.__import__ = _hooked_import
     importlib.import_module = _hooked_import_module
@@ -959,6 +985,12 @@ except BaseException as exc:
 
 with open(result_path, "w", encoding="utf-8") as handle:
     json.dump({"modules": sorted(modules) if error is None else [], "error": error}, handle)
+
+# A pack that started a non-daemon thread would hold a normal exit until the
+# thread ends, and the parent would time out on a result already on disk.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
 '''
 
 
@@ -1002,10 +1034,35 @@ def _trace_log_line(package: dict[str, Any]) -> tuple[str, str]:
 
 
 def _kill(process: "subprocess.Popen[bytes]") -> None:
+    """
+    End the trace interpreter AND anything it started. A pack's import may
+    spawn a helper; killing only the interpreter would leave that helper
+    running, one more per retry.
+    """
+    if sys.platform == "win32":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+    else:
+        # The child is its own session (Popen start_new_session), so its
+        # process group is exactly the tree it spawned.
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
     with contextlib.suppress(OSError):
         process.kill()
     with contextlib.suppress(Exception):
         process.wait(timeout=5)
+
+
+def _trace_process_group_kwargs() -> dict[str, Any]:
+    """Popen options that make the child the root of a killable tree."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 def _trace_imports(
@@ -1035,6 +1092,7 @@ def _trace_imports(
                     stdin=subprocess.PIPE,
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    **_trace_process_group_kwargs(),
                 )
             except OSError as exc:
                 return TraceResult(set(), f"Could not start the trace interpreter: {exc}")

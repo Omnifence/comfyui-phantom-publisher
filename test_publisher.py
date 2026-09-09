@@ -879,6 +879,21 @@ class EnvironmentLockTests(unittest.TestCase):
             for name in names:
                 self.assertIn(name, lock["distributions"])
 
+    def test_a_distribution_with_unreadable_metadata_is_skipped_not_fatal(self):
+        class _Broken:
+            @property
+            def metadata(self):
+                raise KeyError("half-written .dist-info")
+
+            version = "0"
+
+        with _installed({"cv2": ("opencv-python", "4.10.0.84")}):
+            good = list(publisher.importlib.metadata.distributions())
+            publisher.importlib.metadata.distributions = lambda: [_Broken(), *good]
+            lock = publisher._environment_lock()
+        self.assertEqual(lock["distributions"], {"opencv-python": "4.10.0.84"})
+        self.assertEqual(lock["modules"], {"cv2": ["opencv-python"]})
+
     def test_a_module_whose_distribution_has_no_version_is_left_out(self):
         with _installed({"cv2": ("opencv-python", "4.10.0.84")}):
             publisher.importlib.metadata.packages_distributions = lambda: {
@@ -910,6 +925,21 @@ class _FakeComfyRoot:
         (self.root / "utils" / "__init__.py").touch()
         (self.root / "utils" / "extra_config.py").touch()
         (self.root / "nodes.py").write_text(nodes_source, encoding="utf-8")
+        # ComfyUI's server: `PromptServer.instance` exists only once the
+        # constructor has run, which packs that register routes rely on.
+        (self.root / "server.py").write_text(
+            "class _Routes:\n"
+            "    def get(self, path):\n"
+            "        return lambda handler: handler\n"
+            "\n"
+            "class PromptServer:\n"
+            "    instance = None\n"
+            "    def __init__(self, loop):\n"
+            "        PromptServer.instance = self\n"
+            "        self.loop = loop\n"
+            "        self.routes = _Routes()\n",
+            encoding="utf-8",
+        )
         (self.root / "stubdist.py").write_text("VALUE = 1\n", encoding="utf-8")
         self.custom_nodes = self.root / "custom_nodes"
         self.custom_nodes.mkdir()
@@ -978,6 +1008,43 @@ class ImportTraceTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertNotIn(str(package).replace(".", "_x_"), result.modules)
 
+    def test_a_package_that_registers_routes_at_import_is_traced(self):
+        # ComfyUI constructs PromptServer before it loads custom nodes, so a
+        # pack may reach `PromptServer.instance.routes` at import time.
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package(
+            "pack_a",
+            "from server import PromptServer\n"
+            "import stubdist\n"
+            "@PromptServer.instance.routes.get('/pack_a')\n"
+            "async def handler(request):\n"
+            "    return None\n",
+        )
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+        # `server` is recorded like any import; the pin rule ignores it.
+        self.assertIn("server", publisher._COMFYUI_MODULES)
+
+    def test_a_package_that_leaves_a_thread_running_still_yields_its_result(self):
+        # Interpreter shutdown would wait for a non-daemon thread; the trace
+        # must not, or the parent times out on a result already written.
+        self.addCleanup(
+            setattr, publisher, "_TRACE_TIMEOUT_SECONDS", publisher._TRACE_TIMEOUT_SECONDS
+        )
+        publisher._TRACE_TIMEOUT_SECONDS = 20
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package(
+            "pack_a",
+            "import threading\nimport time\nimport stubdist\n"
+            "threading.Thread(target=time.sleep, args=(60,)).start()\n",
+        )
+        started = time.monotonic()
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+
 
 class _StubInterpreter:
     """Replace `sys.executable` with a shell script for the duration."""
@@ -1021,6 +1088,34 @@ class ImportTraceProcessTests(unittest.TestCase):
         self.assertEqual(result.modules, set())
         self.assertIn("timed out", result.error)
         self.assertIn("still loading", result.error)
+
+    def test_a_timeout_kills_what_the_child_spawned(self):
+        publisher._TRACE_TIMEOUT_SECONDS = 0.5
+        # $2 is the result path: a grandchild records its pid beside it.
+        _StubInterpreter(self, 'sleep 60 &\necho $! > "$2.grandchild"\nwait\n')
+        captured: list[str] = []
+        original = publisher._kill
+
+        def kill(process):
+            result_dir = Path(process.args[2]).parent
+            captured.append((result_dir / "result.json.grandchild").read_text().strip())
+            original(process)
+
+        publisher._kill = kill
+        self.addCleanup(setattr, publisher, "_kill", original)
+        result = publisher._trace_imports(self.package, self.comfy.root)
+        self.assertIn("timed out", result.error)
+        grandchild = int(captured[0])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(grandchild, 9)
+            self.fail(f"grandchild {grandchild} survived the timeout kill")
 
     def test_a_cancel_kills_the_child_and_raises(self):
         _StubInterpreter(self, "sleep 30\n")
