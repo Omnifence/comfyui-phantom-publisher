@@ -787,6 +787,37 @@ class PipDependencyCaptureTests(unittest.TestCase):
                 self.assertEqual(publisher._pip_dependencies(package), [])
 
 
+    def test_pins_a_module_only_the_runtime_trace_saw(self):
+        # The DiffusionWave packs import `imageio` from inside a compiled
+        # `_dw_core` extension. No `.py` source names it, so static capture
+        # missed it, the pack installed clean, failed to import at startup,
+        # and the build refused the image for registering no classes.
+        with tempfile.TemporaryDirectory() as temporary:
+            package = self._package(temporary, "import numpy\n")
+            with _installed(
+                {"numpy": ("numpy", "1.26.4"), "imageio": ("imageio", "2.37.0")}
+            ):
+                self.assertEqual(publisher._pip_dependencies(package), [])
+                self.assertEqual(
+                    publisher._pip_dependencies(package, {"imageio", "numpy"}),
+                    ["imageio==2.37.0"],
+                )
+
+    def test_a_hoisted_module_map_and_provided_set_are_honoured(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = self._package(temporary, "import svgwrite\nimport imageio\n")
+            with _installed(
+                {"svgwrite": ("svgwrite", "1.4.3"), "imageio": ("imageio", "2.37.0")}
+            ):
+                pinned = publisher._pip_dependencies(
+                    package,
+                    None,
+                    module_to_distributions={"svgwrite": ["svgwrite"], "imageio": ["imageio"]},
+                    provided={"imageio"},
+                )
+        self.assertEqual(pinned, ["svgwrite==1.4.3"])
+
+
 class _installed:
     """Pin importlib.metadata to a fixed installed set for the duration."""
 
@@ -796,6 +827,7 @@ class _installed:
     def __enter__(self):
         self._packages_distributions = publisher.importlib.metadata.packages_distributions
         self._version = publisher.importlib.metadata.version
+        self._distributions = publisher.importlib.metadata.distributions
         versions = {distribution: version for distribution, version in self._mapping.values()}
 
         def version(name: str) -> str:
@@ -807,11 +839,356 @@ class _installed:
             module: [distribution] for module, (distribution, _) in self._mapping.items()
         }
         publisher.importlib.metadata.version = version
+        publisher.importlib.metadata.distributions = lambda: [
+            types.SimpleNamespace(metadata={"Name": name}, version=release)
+            for name, release in versions.items()
+        ]
         return self
 
     def __exit__(self, *_exc: object) -> None:
         publisher.importlib.metadata.packages_distributions = self._packages_distributions
         publisher.importlib.metadata.version = self._version
+        publisher.importlib.metadata.distributions = self._distributions
+
+
+class EnvironmentLockTests(unittest.TestCase):
+    """
+    The manifest carries the publishing venv so the build can resolve a module
+    the capture missed — an import a node makes only while a workflow runs —
+    against the versions that are known to work, instead of guessing.
+    """
+
+    def test_the_two_maps_are_normalised_and_consistent(self):
+        with _installed(
+            {
+                "cv2": ("opencv-python", "4.10.0.84"),
+                "imageio": ("ImageIO", "2.37.0"),
+                "PIL": ("Pillow", "11.0.0"),
+            }
+        ):
+            lock = publisher._environment_lock()
+        self.assertEqual(
+            lock["distributions"],
+            {"imageio": "2.37.0", "opencv-python": "4.10.0.84", "pillow": "11.0.0"},
+        )
+        self.assertEqual(
+            lock["modules"],
+            {"PIL": ["pillow"], "cv2": ["opencv-python"], "imageio": ["imageio"]},
+        )
+        for names in lock["modules"].values():
+            for name in names:
+                self.assertIn(name, lock["distributions"])
+
+    def test_a_distribution_with_unreadable_metadata_is_skipped_not_fatal(self):
+        class _Broken:
+            @property
+            def metadata(self):
+                raise KeyError("half-written .dist-info")
+
+            version = "0"
+
+        with _installed({"cv2": ("opencv-python", "4.10.0.84")}):
+            good = list(publisher.importlib.metadata.distributions())
+            publisher.importlib.metadata.distributions = lambda: [_Broken(), *good]
+            lock = publisher._environment_lock()
+        self.assertEqual(lock["distributions"], {"opencv-python": "4.10.0.84"})
+        self.assertEqual(lock["modules"], {"cv2": ["opencv-python"]})
+
+    def test_a_module_whose_distribution_has_no_version_is_left_out(self):
+        with _installed({"cv2": ("opencv-python", "4.10.0.84")}):
+            publisher.importlib.metadata.packages_distributions = lambda: {
+                "cv2": ["opencv-python"],
+                "ghost": ["not-installed"],
+            }
+            lock = publisher._environment_lock()
+        self.assertNotIn("ghost", lock["modules"])
+        self.assertEqual(lock["modules"], {"cv2": ["opencv-python"]})
+
+
+class _FakeComfyRoot:
+    """
+    Enough of a ComfyUI source tree for the trace script: `comfy.cli_args`,
+    `utils.extra_config`, `nodes`, a `stubdist` module standing in for an
+    installed distribution, and one custom_nodes directory.
+    """
+
+    def __init__(self, testcase: unittest.TestCase, *, nodes_source: str = "") -> None:
+        temporary = tempfile.TemporaryDirectory()
+        testcase.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "comfy").mkdir()
+        (self.root / "comfy" / "__init__.py").touch()
+        (self.root / "comfy" / "cli_args.py").write_text(
+            "import types\nargs = types.SimpleNamespace(cpu=False)\n", encoding="utf-8"
+        )
+        (self.root / "utils").mkdir()
+        (self.root / "utils" / "__init__.py").touch()
+        (self.root / "utils" / "extra_config.py").touch()
+        (self.root / "nodes.py").write_text(nodes_source, encoding="utf-8")
+        # ComfyUI's server: `PromptServer.instance` exists only once the
+        # constructor has run, which packs that register routes rely on.
+        (self.root / "server.py").write_text(
+            "class _Routes:\n"
+            "    def get(self, path):\n"
+            "        return lambda handler: handler\n"
+            "\n"
+            "class PromptServer:\n"
+            "    instance = None\n"
+            "    def __init__(self, loop):\n"
+            "        PromptServer.instance = self\n"
+            "        self.loop = loop\n"
+            "        self.routes = _Routes()\n",
+            encoding="utf-8",
+        )
+        (self.root / "stubdist.py").write_text("VALUE = 1\n", encoding="utf-8")
+        self.custom_nodes = self.root / "custom_nodes"
+        self.custom_nodes.mkdir()
+
+    def package(self, name: str, init_source: str) -> Path:
+        directory = self.custom_nodes / name
+        directory.mkdir()
+        (directory / "__init__.py").write_text(init_source, encoding="utf-8")
+        return directory
+
+
+class ImportTraceTests(unittest.TestCase):
+    """
+    The trace script runs under the real interpreter against a fake ComfyUI,
+    because what it has to get right — the `sys.modules` diff and the two
+    import hooks — cannot be asserted from a string.
+    """
+
+    def test_attributes_a_static_import_the_baseline_did_not_load(self):
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package("pack_a", "import stubdist\n")
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+
+    def test_attributes_a_cached_dynamic_import_through_the_hook(self):
+        # The baseline (ComfyUI's own `nodes`) already imported the module, so
+        # the `sys.modules` diff is empty for it, and `importlib.import_module`
+        # returns the cached module without going through `builtins.__import__`.
+        comfy = _FakeComfyRoot(self, nodes_source="import stubdist\n")
+        package = comfy.package(
+            "pack_a", "import importlib\n_dep = importlib.import_module('stubdist')\n"
+        )
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+
+    def test_attributes_a_cached_static_import_through_the_hook(self):
+        comfy = _FakeComfyRoot(self, nodes_source="import stubdist\n")
+        package = comfy.package("pack_a", "import stubdist\n")
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+
+    def test_a_package_that_raises_reports_the_error_and_no_modules(self):
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package("pack_a", "raise RuntimeError('boom at import')\n")
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNotNone(result.error)
+        self.assertIn("boom at import", result.error)
+        self.assertEqual(result.modules, set())
+
+    def test_a_package_that_floods_stdout_still_yields_a_result(self):
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package(
+            "pack_a", "import sys\nsys.stdout.write('x' * (1 << 20))\nimport stubdist\n"
+        )
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+
+    def test_the_package_own_path_derived_module_name_is_not_a_module(self):
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package("pack.with.dots", "import stubdist\n")
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertNotIn(str(package).replace(".", "_x_"), result.modules)
+
+    def test_a_package_that_registers_routes_at_import_is_traced(self):
+        # ComfyUI constructs PromptServer before it loads custom nodes, so a
+        # pack may reach `PromptServer.instance.routes` at import time.
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package(
+            "pack_a",
+            "from server import PromptServer\n"
+            "import stubdist\n"
+            "@PromptServer.instance.routes.get('/pack_a')\n"
+            "async def handler(request):\n"
+            "    return None\n",
+        )
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+        # `server` is recorded like any import; the pin rule ignores it.
+        self.assertIn("server", publisher._COMFYUI_MODULES)
+
+    def test_a_package_that_leaves_a_thread_running_still_yields_its_result(self):
+        # Interpreter shutdown would wait for a non-daemon thread; the trace
+        # must not, or the parent times out on a result already written.
+        self.addCleanup(
+            setattr, publisher, "_TRACE_TIMEOUT_SECONDS", publisher._TRACE_TIMEOUT_SECONDS
+        )
+        publisher._TRACE_TIMEOUT_SECONDS = 20
+        comfy = _FakeComfyRoot(self)
+        package = comfy.package(
+            "pack_a",
+            "import threading\nimport time\nimport stubdist\n"
+            "threading.Thread(target=time.sleep, args=(60,)).start()\n",
+        )
+        started = time.monotonic()
+        result = publisher._trace_imports(package, comfy.root)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertIsNone(result.error)
+        self.assertIn("stubdist", result.modules)
+
+
+class _StubInterpreter:
+    """Replace `sys.executable` with a shell script for the duration."""
+
+    def __init__(self, testcase: unittest.TestCase, body: str) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        testcase.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "python"
+        self.path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        self.path.chmod(0o755)
+        original = publisher.sys.executable
+        publisher.sys.executable = str(self.path)
+        testcase.addCleanup(setattr, publisher.sys, "executable", original)
+
+
+class ImportTraceProcessTests(unittest.TestCase):
+    """The parent's half: result parsing, timeout, cancel and fallback."""
+
+    def setUp(self) -> None:
+        self.comfy = _FakeComfyRoot(self)
+        self.package = self.comfy.package("pack_a", "")
+        self._timeout = publisher._TRACE_TIMEOUT_SECONDS
+        self.addCleanup(setattr, publisher, "_TRACE_TIMEOUT_SECONDS", self._timeout)
+
+    def test_parses_the_result_file_the_child_writes(self):
+        _StubInterpreter(
+            self,
+            'printf \'{"modules": ["imageio", "numpy"], "error": null}\' > "$2"\n',
+        )
+        # $1 is "-" (the script comes on stdin); $2 is the result path.
+        result = publisher._trace_imports(self.package, self.comfy.root)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.modules, {"imageio", "numpy"})
+
+    def test_a_timeout_kills_the_child_and_falls_back(self):
+        publisher._TRACE_TIMEOUT_SECONDS = 0.5
+        _StubInterpreter(self, 'echo "still loading"\nsleep 30\n')
+        started = time.monotonic()
+        result = publisher._trace_imports(self.package, self.comfy.root)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result.modules, set())
+        self.assertIn("timed out", result.error)
+        self.assertIn("still loading", result.error)
+
+    def test_a_timeout_kills_what_the_child_spawned(self):
+        publisher._TRACE_TIMEOUT_SECONDS = 0.5
+        # $2 is the result path: a grandchild records its pid beside it.
+        _StubInterpreter(self, 'sleep 60 &\necho $! > "$2.grandchild"\nwait\n')
+        captured: list[str] = []
+        original = publisher._kill
+
+        def kill(process):
+            result_dir = Path(process.args[2]).parent
+            captured.append((result_dir / "result.json.grandchild").read_text().strip())
+            original(process)
+
+        publisher._kill = kill
+        self.addCleanup(setattr, publisher, "_kill", original)
+        result = publisher._trace_imports(self.package, self.comfy.root)
+        self.assertIn("timed out", result.error)
+        grandchild = int(captured[0])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(grandchild, 9)
+            self.fail(f"grandchild {grandchild} survived the timeout kill")
+
+    def test_a_cancel_kills_the_child_and_raises(self):
+        _StubInterpreter(self, "sleep 30\n")
+        cancellation = threading.Event()
+        threading.Timer(0.3, cancellation.set).start()
+        started = time.monotonic()
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._trace_imports(self.package, self.comfy.root, cancellation)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_child_that_writes_no_result_falls_back_with_the_log(self):
+        _StubInterpreter(self, 'echo "nothing to report"\nexit 0\n')
+        result = publisher._trace_imports(self.package, self.comfy.root)
+        self.assertEqual(result.modules, set())
+        self.assertIn("no readable result", result.error)
+        self.assertIn("nothing to report", result.error)
+
+    def test_a_non_zero_exit_falls_back_with_the_log(self):
+        _StubInterpreter(self, 'echo "segfault-ish"\nexit 3\n')
+        result = publisher._trace_imports(self.package, self.comfy.root)
+        self.assertEqual(result.modules, set())
+        self.assertIn("exited with 3", result.error)
+        self.assertIn("segfault-ish", result.error)
+
+
+class DependencyCaptureManifestTests(unittest.TestCase):
+    """Every archived package says HOW its dependencies were captured."""
+
+    def _discover(self, env, nodes_spec):
+        packages = publisher._discover_packages(*_workflow(nodes_spec))
+        for package in packages:
+            if package.get("_archive_path"):
+                self.addCleanup(
+                    shutil.rmtree, str(Path(package["_archive_path"]).parent), ignore_errors=True
+                )
+        return packages
+
+    def test_every_package_carries_a_dependency_capture(self):
+        env = _CustomNodesEnvironment(self)
+        env.package("pack_a", ["A_Node"])
+        env.package("pack_b", ["B_Node"])
+        packages = self._discover(env, [("A_Node", {}), ("B_Node", {})])
+        self.assertEqual(len(packages), 2)
+        for package in packages:
+            capture = package["dependency_capture"]
+            self.assertIn(capture["method"], {"runtime", "static"})
+            if capture["method"] == "static":
+                self.assertIsInstance(capture["error"], str)
+            else:
+                self.assertIsNone(capture["error"])
+
+    def test_the_log_line_names_the_method_and_the_reason(self):
+        message, level = publisher._trace_log_line(
+            {
+                "_package_directory": "/x/custom_nodes/pack_a",
+                "dependency_capture": {"method": "runtime", "error": None},
+                "_trace_seconds": 12.44,
+                "_trace_module_count": 3,
+            }
+        )
+        self.assertEqual((message, level), ("Traced imports of pack_a (3 modules, 12.4 s)", "info"))
+        message, level = publisher._trace_log_line(
+            {
+                "_package_directory": "/x/custom_nodes/pack_a",
+                "dependency_capture": {
+                    "method": "static",
+                    "error": "Traceback...\nModuleNotFoundError: No module named 'comfy'\n",
+                },
+            }
+        )
+        self.assertEqual(level, "warning")
+        self.assertIn("captured statically", message)
+        self.assertIn("No module named 'comfy'", message)
 
 
 class ConfigPermissionTests(unittest.TestCase):
