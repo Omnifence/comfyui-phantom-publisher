@@ -8,6 +8,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -27,7 +28,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.7.1"
+PUBLISHER_VERSION = "0.8.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -489,6 +490,250 @@ def _declared_requirements(directory: Path) -> set[str]:
     return declared
 
 
+def _runtime() -> dict[str, Any]:
+    """
+    The interpreter this ComfyUI runs, recorded in every manifest.
+
+    A node package can ship its logic as a compiled CPython extension rather
+    than source — the DiffusionWave packs are Nuitka binaries — and such a
+    binary loads on exactly one Python minor version and one platform. Phantom
+    builds every workflow of a target into ONE image with ONE Python, so the
+    author has to know when a pack they run happily here can never import
+    there. The runtime is what Phantom compares its image against.
+    """
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    glibc = platform.libc_ver()[1] or None
+    return {
+        "python": version,
+        "python_tag": f"cp{sys.version_info[0]}{sys.version_info[1]}",
+        "system": platform.system() or None,
+        "machine": platform.machine() or None,
+        "glibc": glibc,
+    }
+
+
+_COMPILED_EXTENSION_SUFFIX = re.compile(r"\.(so|pyd|dylib)$", re.IGNORECASE)
+# `_dw_core.cpython-313-x86_64-linux-gnu.so`, `_core.cpython-312-darwin.so`,
+# `_core.cp313-win_amd64.pyd`. A `t` after the minor marks a free-threaded build.
+_CPYTHON_TAG = re.compile(
+    r"\.(?:cpython-|cp)(\d)(\d{1,2})t?(?:-([a-z0-9_-]+))?\.(?:so|pyd|dylib)$", re.IGNORECASE
+)
+_ABI3_TAG = re.compile(r"\.abi3\.(?:so|pyd|dylib)$", re.IGNORECASE)
+
+
+def _compiled_extensions(directory: Path) -> list[str]:
+    """
+    Archive-relative paths of every compiled Python extension in the package,
+    in the same shape the archive names them (`<directory>/<relative path>`).
+    """
+    found: list[str] = []
+    for source in sorted(directory.rglob("*")):
+        if ".git" in source.parts or "__pycache__" in source.parts:
+            continue
+        if source.is_file() and _COMPILED_EXTENSION_SUFFIX.search(source.name):
+            found.append(f"{directory.name}/{source.relative_to(directory).as_posix()}")
+    return found
+
+
+def _extension_system(name: str, platform_tag: str = "") -> str | None:
+    haystack = f"{name} {platform_tag}".lower()
+    if name.lower().endswith(".pyd") or re.search(r"win(32|_amd64|_arm64)", haystack):
+        return "windows"
+    if name.lower().endswith(".dylib") or re.search(r"darwin|macosx", haystack):
+        return "darwin"
+    if "linux" in haystack:
+        return "linux"
+    return None
+
+
+def _parse_compiled_extension(path: str) -> dict[str, Any] | None:
+    """
+    The build tag a compiled extension's filename carries: the Python minor it
+    was built for (None for a stable-ABI or untagged build), whether it is
+    abi3, and the operating system when the tag names one.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if not _COMPILED_EXTENSION_SUFFIX.search(name):
+        return None
+    if _ABI3_TAG.search(name):
+        return {"path": path, "python": None, "abi3": True, "system": _extension_system(name)}
+    tag = _CPYTHON_TAG.search(name)
+    if not tag:
+        return {"path": path, "python": None, "abi3": False, "system": _extension_system(name)}
+    return {
+        "path": path,
+        "python": f"{tag.group(1)}.{tag.group(2)}",
+        "abi3": False,
+        "system": _extension_system(name, tag.group(3) or ""),
+    }
+
+
+_SYSTEM_LABEL = {"linux": "Linux", "darwin": "macOS", "windows": "Windows"}
+
+
+def _package_display_name(package: dict[str, Any]) -> str:
+    return package.get("cnr_id") or Path(package.get("_package_directory") or "package").name
+
+
+def _foreign_platform_problems(
+    packages: list[dict[str, Any]], runtime: dict[str, Any] | None
+) -> list[str]:
+    """
+    One sentence per binary that no Linux x86_64 image can load, whatever its
+    Python: macOS and Windows builds.
+    """
+    target_system = (runtime or {}).get("system") or "Linux"
+    target_machine = (runtime or {}).get("machine") or "x86_64"
+    problems: list[str] = []
+    for package in packages:
+        name = _package_display_name(package)
+        for path in package.get("compiled_extensions") or []:
+            extension = _parse_compiled_extension(path)
+            if not extension or not extension["system"] or extension["system"] == "linux":
+                continue
+            problems.append(
+                f'Package "{name}" contains a compiled module built for '
+                f'{_SYSTEM_LABEL[extension["system"]]} ({path}). Phantom runs workflows on '
+                f"{target_system} {target_machine}. Install the Linux build of this "
+                "package in ComfyUI, or ask the package author for one, then publish again."
+            )
+    return problems
+
+
+def _python_key(version: str) -> tuple[int, int]:
+    major, _, minor = version.partition(".")
+    return (int(major or 0), int(minor or 0))
+
+
+def _package_python_constraint(package: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    The SET of Pythons a package's tagged Linux binaries cover — a vendor can
+    ship one binary per Python — or None when it carries no tagged binary and
+    so constrains nothing. Mirrors Phantom's `packagePythonConstraint`.
+    """
+    paths: dict[str, str] = {}
+    for path in package.get("compiled_extensions") or []:
+        extension = _parse_compiled_extension(path)
+        if not extension or not extension["python"] or extension["abi3"]:
+            continue
+        if extension["system"] and extension["system"] != "linux":
+            continue
+        paths.setdefault(extension["python"], path)
+    if not paths:
+        return None
+    return {
+        "package": _package_display_name(package),
+        "pythons": sorted(paths, key=_python_key),
+        "paths": paths,
+    }
+
+
+def _describe_constraint(constraint: dict[str, Any]) -> str:
+    python = constraint["pythons"][0]
+    versions = " or ".join(constraint["pythons"]) if len(constraint["pythons"]) > 1 else python
+    return (
+        f'Package "{constraint["package"]}" in {constraint["graph"]} is built for Python '
+        f'{versions} ({constraint["paths"][python]})'
+    )
+
+
+_GRAPH_CONFLICT_ADVICE = (
+    "Publish both graphs from the same ComfyUI, install matching builds of the packages, "
+    "or split them into separate workflows in Phantom."
+)
+
+
+def _image_python_problem(
+    packages: list[dict[str, Any]], runtime: dict[str, Any] | None
+) -> str | None:
+    """
+    Why this graph could never share the target's image, or None when it can.
+
+    Phantom builds the image for whichever Python the binaries need, so a
+    binary alone is never a problem. What is: a disagreement between this
+    graph's binaries and the ones the target's current graphs already carry
+    (`runtime.constraints`), and a Python torch ships no wheels for
+    (`runtime.supported_pythons`). Empty runtime — an older Phantom — checks
+    nothing; Phantom's own intake is the authority either way.
+    """
+    if not isinstance(runtime, dict):
+        return None
+    existing = [
+        dict(constraint)
+        for constraint in runtime.get("constraints") or []
+        if isinstance(constraint, dict) and constraint.get("pythons")
+    ]
+    mine = []
+    for package in packages:
+        constraint = _package_python_constraint(package)
+        if constraint:
+            mine.append({"graph": "this graph", **constraint})
+    constraints = existing + mine
+    if not constraints:
+        return None
+    candidates = set(constraints[0]["pythons"])
+    for constraint in constraints[1:]:
+        candidates &= set(constraint["pythons"])
+    if not candidates:
+        first = constraints[0]
+        other = next(
+            (c for c in constraints[1:] if not set(c["pythons"]) & set(first["pythons"])),
+            None,
+        )
+        if other is None:
+            facts = ", but ".join(_describe_constraint(c) for c in constraints)
+            return (
+                f"{facts}. One image serves every graph of a workflow, and these packages "
+                f"agree on no Python. {_GRAPH_CONFLICT_ADVICE}"
+            )
+        described = _describe_constraint(other)
+        described = described[0].lower() + described[1:]
+        return (
+            f"{_describe_constraint(first)}, but {described}. One image serves every graph "
+            f"of a workflow. {_GRAPH_CONFLICT_ADVICE}"
+        )
+    base = runtime.get("python")
+    if base in candidates:
+        return None
+    supported = runtime.get("supported_pythons")
+    if not isinstance(supported, list) or not supported:
+        return None
+    if candidates & set(supported):
+        return None
+    wanted = sorted(candidates, key=_python_key)
+    named = next(c for c in constraints if set(c["pythons"]) & candidates)
+    return (
+        f"{_describe_constraint(named)}. Phantom can build images for Python "
+        f"{_list_pythons(supported)}; PyTorch ships no wheels for {_list_pythons(wanted)} yet."
+    )
+
+
+def _list_pythons(pythons: list[str]) -> str:
+    if len(pythons) <= 1:
+        return pythons[0] if pythons else ""
+    return f"{', '.join(pythons[:-1])} and {pythons[-1]}"
+
+
+async def _target_runtime(
+    workflow_id: str, config: dict[str, Any]
+) -> dict[str, Any] | None:
+    """
+    The runtime Phantom's image runs for this target, or None when the server
+    does not say (a Phantom older than this field, or a target it no longer
+    lists). Every variation of a workflow shares that image, so the check is
+    against the target, never against a single graph.
+    """
+    listing = await _phantom_request("GET", "/targets", config)
+    targets = listing.get("targets") if isinstance(listing, dict) else None
+    if not isinstance(targets, list):
+        return None
+    for target in targets:
+        if isinstance(target, dict) and target.get("workflow_id") == workflow_id:
+            runtime = target.get("runtime")
+            return runtime if isinstance(runtime, dict) else None
+    return None
+
+
 def _pip_dependencies(directory: Path) -> list[str]:
     """
     The installed distributions this node package imports, version-pinned.
@@ -850,6 +1095,7 @@ def _archive_grouped_packages(
             "cnr_id": cnr_id,
             "version": version,
             "pip_dependencies": _pip_dependencies(directory),
+            "compiled_extensions": _compiled_extensions(directory),
             **_git_metadata(directory),
             "archive_sha256": None,
             "_package_directory": str(directory),
@@ -1352,6 +1598,40 @@ async def _run_publish(
             report_skipped_repository,
             archives=_external_model_archives,
         )
+        runtime = _runtime()
+        target_runtime = await _target_runtime(body["workflow_id"], config)
+        if target_runtime:
+            _job_step(
+                job,
+                "Checking custom node packages against Phantom's image "
+                f"(Python {target_runtime.get('python') or 'unknown'}, "
+                f"{target_runtime.get('system') or 'Linux'} "
+                f"{target_runtime.get('machine') or 'x86_64'})…",
+                status="discovering",
+                progress=18,
+            )
+            # Refused HERE, before a byte uploads and before Phantom stages a
+            # version. Phantom builds the image for whichever Python the
+            # binaries need; what it cannot build is a graph whose binaries
+            # disagree with the workflow's other graphs, a Python torch has
+            # no wheels for, or a binary for another operating system. Only
+            # the author can resolve those.
+            problems = _foreign_platform_problems(packages, target_runtime)
+            problem = _image_python_problem(packages, target_runtime)
+            if problem:
+                problems.append(problem)
+            if problems:
+                raise RuntimeError(" ".join(problems))
+            local_minor = ".".join(runtime["python"].split(".")[:2])
+            target_python = target_runtime.get("python")
+            if target_python and local_minor != target_python:
+                _job_log(
+                    job,
+                    f"This ComfyUI runs Python {runtime['python']}; Phantom's image starts "
+                    f"from Python {target_python} and installs the Python a package's "
+                    "compiled extensions need. Every compiled extension in this publish "
+                    "was checked against the workflow's other graphs.",
+                )
         dependencies, uploads = _dependency_progress(models, packages)
         total_upload_bytes = sum(size for _, _, size, _ in uploads)
         job.update(
@@ -1372,6 +1652,7 @@ async def _run_publish(
                 "core_version": _comfyui_core_version(),
                 "frontend_version": None,
                 "publisher_version": PUBLISHER_VERSION,
+                "runtime": runtime,
             },
             "workflow": {"api": api_workflow, "ui": ui_workflow},
             "node_packages": [

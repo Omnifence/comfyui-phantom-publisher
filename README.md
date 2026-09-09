@@ -73,7 +73,22 @@ workflow fills it in.
 - Every custom node package the graph uses, with its git commit or package
   version, as a normalized archive.
 - Every model the graph references, with its SHA-256 digest and source URL.
-- The ComfyUI core version and the publisher version.
+- The ComfyUI core version, the publisher version, and the Python this
+  ComfyUI runs.
+- For each package, the paths of its compiled Python extensions (`.so`,
+  `.pyd`, `.dylib`).
+
+Before anything uploads, the publisher checks each package's compiled
+extensions (`.so`, `.pyd`, `.dylib`). Phantom builds the workflow's image for
+whichever Python those binaries need, so a package built for a newer Python
+than the image's default is fine. Every graph of a workflow shares that one
+image, so what stops a publish is a disagreement: a binary in this graph built
+for Python 3.13 while a package in the workflow's primary graph, or in another
+variation, is built for Python 3.12. The message names both packages, both
+files and both versions. Publish both graphs from the same ComfyUI, install
+matching builds of the packages, or split them into separate workflows in
+Phantom. A binary built for macOS or Windows, or for a Python that PyTorch
+ships no wheels for, is refused the same way.
 
 Uploads are content addressed. Phantom asks for a dependency by digest and the
 publisher uploads it only when Phantom does not hold it already, so a second
