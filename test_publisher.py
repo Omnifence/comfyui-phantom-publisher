@@ -2172,6 +2172,316 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
         publisher._job_tasks.pop(response.body["job_id"], None)
 
 
+class CompiledExtensionTests(unittest.TestCase):
+    """
+    A node pack can ship its logic as a CPython extension — the DiffusionWave
+    packs are Nuitka binaries named `_dw_core.cpython-313-x86_64-linux-gnu.so`.
+    Such a binary loads on one Python minor and one platform. The publishing
+    ComfyUI ran 3.13, Phantom's image runs 3.12, and the pack registered no
+    classes there: the build passed and the first request that needed the
+    node failed. This is the publish-time check that names it instead.
+    """
+
+    def test_reads_the_python_minor_and_platform_off_a_soabi_tag(self):
+        self.assertEqual(
+            publisher._parse_compiled_extension(
+                "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so"
+            ),
+            {
+                "path": "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so",
+                "python": "3.13",
+                "abi3": False,
+                "system": "linux",
+            },
+        )
+        self.assertEqual(
+            publisher._parse_compiled_extension("pack/_core.cp312-win_amd64.pyd")["system"],
+            "windows",
+        )
+        self.assertEqual(
+            publisher._parse_compiled_extension("pack/_core.cpython-312-darwin.so")["system"],
+            "darwin",
+        )
+        self.assertEqual(
+            publisher._parse_compiled_extension("pack/_core.cpython-314t-x86_64-linux-gnu.so")["python"],
+            "3.14",
+        )
+
+    def test_marks_stable_abi_and_leaves_an_untagged_library_unknown(self):
+        self.assertTrue(publisher._parse_compiled_extension("pack/_core.abi3.so")["abi3"])
+        untagged = publisher._parse_compiled_extension("pack/vendor/libonnx.so")
+        self.assertEqual((untagged["python"], untagged["abi3"], untagged["system"]), (None, False, None))
+        self.assertIsNone(publisher._parse_compiled_extension("pack/nodes.py"))
+
+    def test_lists_compiled_extensions_by_archive_relative_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "DiffusionWave_reactor"
+            (package / "vendor").mkdir(parents=True)
+            (package / "__pycache__").mkdir()
+            (package / "_dw_core.cpython-313-x86_64-linux-gnu.so").write_bytes(b"\x7fELF")
+            (package / "vendor" / "libonnx.so").write_bytes(b"\x7fELF")
+            (package / "__pycache__" / "junk.cpython-313.so").write_bytes(b"")
+            (package / "nodes.py").write_text("", encoding="utf-8")
+            self.assertEqual(
+                publisher._compiled_extensions(package),
+                [
+                    "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so",
+                    "DiffusionWave_reactor/vendor/libonnx.so",
+                ],
+            )
+
+    def test_package_constraint_is_the_set_of_pythons_its_linux_binaries_cover(self):
+        self.assertEqual(
+            publisher._package_python_constraint(
+                {
+                    "cnr_id": None,
+                    "_package_directory": "/comfy/custom_nodes/DiffusionWave_reactor",
+                    "compiled_extensions": [
+                        "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so",
+                        "DiffusionWave_reactor/_dw_core.cpython-312-x86_64-linux-gnu.so",
+                        "DiffusionWave_reactor/_s.abi3.so",
+                        "DiffusionWave_reactor/vendor/libonnx.so",
+                        "DiffusionWave_reactor/_c.cpython-313-darwin.so",
+                    ],
+                }
+            ),
+            {
+                "package": "DiffusionWave_reactor",
+                "pythons": ["3.12", "3.13"],
+                "paths": {
+                    "3.13": "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so",
+                    "3.12": "DiffusionWave_reactor/_dw_core.cpython-312-x86_64-linux-gnu.so",
+                },
+            },
+        )
+        self.assertIsNone(publisher._package_python_constraint({"cnr_id": "pure"}))
+
+    def test_a_binary_for_a_newer_python_than_the_base_is_not_a_problem(self):
+        # Phantom builds the image for the Python the binary needs.
+        runtime = {"python": "3.12", "supported_pythons": ["3.12", "3.13"], "constraints": []}
+        packages = [{"cnr_id": "dw", "compiled_extensions": ["DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so"]}]
+        self.assertIsNone(publisher._image_python_problem(packages, runtime))
+        self.assertEqual(publisher._foreign_platform_problems(packages, runtime), [])
+
+    def test_a_disagreement_with_the_targets_other_graphs_names_both_sides(self):
+        runtime = {
+            "python": "3.12",
+            "supported_pythons": ["3.12", "3.13"],
+            "constraints": [
+                {
+                    "graph": "the primary graph",
+                    "package": "DiffusionWave_PickResolution",
+                    "pythons": ["3.12"],
+                    "paths": {"3.12": "DiffusionWave_PickResolution/_dw_core.cpython-312-x86_64-linux-gnu.so"},
+                }
+            ],
+        }
+        packages = [
+            {
+                "cnr_id": None,
+                "_package_directory": "/comfy/custom_nodes/DiffusionWave_reactor",
+                "compiled_extensions": ["DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so"],
+            }
+        ]
+        self.assertEqual(
+            publisher._image_python_problem(packages, runtime),
+            'Package "DiffusionWave_PickResolution" in the primary graph is built for Python '
+            "3.12 (DiffusionWave_PickResolution/_dw_core.cpython-312-x86_64-linux-gnu.so), but package \"DiffusionWave_reactor\" in this graph is built for "
+            "Python 3.13 (DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so). One image serves every graph of a workflow. Publish both "
+            "graphs from the same ComfyUI, install matching builds of the packages, or split "
+            "them into separate workflows in Phantom.",
+        )
+
+    def test_a_python_torch_has_no_wheels_for_names_what_phantom_can_build(self):
+        runtime = {"python": "3.12", "supported_pythons": ["3.12", "3.13"], "constraints": []}
+        packages = [
+            {
+                "cnr_id": "dw",
+                "compiled_extensions": ["dw/_dw_core.cpython-314-x86_64-linux-gnu.so"],
+            }
+        ]
+        self.assertEqual(
+            publisher._image_python_problem(packages, runtime),
+            'Package "dw" in this graph is built for Python 3.14 '
+            "(dw/_dw_core.cpython-314-x86_64-linux-gnu.so). Phantom can build images for "
+            "Python 3.12 and 3.13; PyTorch ships no wheels for 3.14 yet.",
+        )
+
+    def test_a_foreign_platform_binary_is_refused(self):
+        problems = publisher._foreign_platform_problems(
+            [{"cnr_id": "pack", "compiled_extensions": ["pack/_core.cpython-312-darwin.so"]}],
+            {"python": "3.12", "system": "Linux", "machine": "x86_64"},
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("built for macOS", problems[0])
+        self.assertIn("Phantom runs workflows on Linux x86_64", problems[0])
+
+    def test_an_older_phantom_without_a_runtime_checks_nothing(self):
+        packages = [{"cnr_id": "dw", "compiled_extensions": ["DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so"]}]
+        self.assertIsNone(publisher._image_python_problem(packages, None))
+        self.assertEqual(publisher._foreign_platform_problems(packages, None), [])
+
+    def test_runtime_records_this_interpreter(self):
+        runtime = publisher._runtime()
+        self.assertEqual(
+            runtime["python"], ".".join(str(part) for part in sys.version_info[:3])
+        )
+        self.assertEqual(runtime["python_tag"], f"cp{sys.version_info[0]}{sys.version_info[1]}")
+        self.assertIn("system", runtime)
+        self.assertIn("machine", runtime)
+
+
+class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
+    def _job(self, job_id: str) -> dict[str, Any]:
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Waiting to start…",
+            "dependencies": [],
+            "logs": [],
+        }
+        publisher._jobs[job_id] = job
+        self.addCleanup(publisher._jobs.pop, job_id, None)
+        return job
+
+    def _stub(self, packages: list[dict[str, Any]], request: Any) -> None:
+        originals = {
+            "_read_config": publisher._read_config,
+            "_discover_models": publisher._discover_models,
+            "_discover_packages": publisher._discover_packages,
+            "_discover_huggingface_models": publisher._discover_huggingface_models,
+            "_phantom_request": publisher._phantom_request,
+        }
+        publisher._read_config = lambda: {"origin": "https://phantom.test", "token": "t"}
+        publisher._discover_models = lambda *_args: []
+        publisher._discover_packages = lambda *_args: packages
+        publisher._discover_huggingface_models = lambda *_args: []
+        publisher._phantom_request = request
+        for name, value in originals.items():
+            self.addCleanup(setattr, publisher, name, value)
+
+    async def test_refuses_before_staging_when_the_graphs_would_disagree(self):
+        job = self._job("job-runtime-refused")
+        calls: list[str] = []
+
+        async def fake_request(method, path, _config, *_args, **_kwargs):
+            calls.append(f"{method} {path}")
+            if path == "/targets":
+                return {
+                    "targets": [
+                        {
+                            "workflow_id": "wf-1",
+                            "runtime": {
+                                "python": "3.12",
+                                "system": "Linux",
+                                "machine": "x86_64",
+                                "supported_pythons": ["3.12", "3.13"],
+                                "constraints": [
+                                    {
+                                        "graph": "the primary graph",
+                                        "package": "DiffusionWave_PickResolution",
+                                        "pythons": ["3.12"],
+                                        "paths": {
+                                            "3.12": "DiffusionWave_PickResolution/_dw_core.cpython-312-x86_64-linux-gnu.so"
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                }
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        self._stub(
+            [
+                {
+                    "cnr_id": None,
+                    "_package_directory": "/comfy/custom_nodes/DiffusionWave_reactor",
+                    "class_types": ["dw_reactor"],
+                    "archive_sha256": "c" * 64,
+                    "compiled_extensions": [
+                        "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so"
+                    ],
+                }
+            ],
+            fake_request,
+        )
+        await publisher._run_publish("job-runtime-refused", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn('Package "DiffusionWave_PickResolution" in the primary graph is built for Python 3.12', job["error"])
+        self.assertIn('package "DiffusionWave_reactor" in this graph is built for Python 3.13', job["error"])
+        self.assertIn("Publish both graphs from the same ComfyUI", job["error"])
+        # Nothing staged, nothing uploaded: the only call was the runtime lookup.
+        self.assertEqual(calls, ["GET /targets"])
+
+    async def test_publishes_and_records_the_runtime_when_nothing_disagrees(self):
+        # The binary is cp313 and the base runs 3.12: Phantom's image follows
+        # the binary, so this publishes.
+        job = self._job("job-runtime-ok")
+        bodies: list[Any] = []
+
+        async def fake_request(method, path, _config, body=None, *_args, **_kwargs):
+            if path == "/targets":
+                return {
+                    "targets": [
+                        {
+                            "workflow_id": "wf-1",
+                            "runtime": {
+                                "python": "3.12",
+                                "supported_pythons": ["3.12", "3.13"],
+                                "constraints": [],
+                            },
+                        }
+                    ]
+                }
+            if path == "/versions":
+                bodies.append(body)
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        self._stub(
+            [
+                {
+                    "cnr_id": "pack",
+                    "class_types": ["Node"],
+                    "archive_sha256": "c" * 64,
+                    "compiled_extensions": ["pack/_core.cpython-313-x86_64-linux-gnu.so"],
+                }
+            ],
+            fake_request,
+        )
+        await publisher._run_publish("job-runtime-ok", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        manifest = bodies[0]["manifest"]
+        self.assertEqual(manifest["comfyui"]["runtime"]["python_tag"], f"cp{sys.version_info[0]}{sys.version_info[1]}")
+        self.assertEqual(
+            manifest["node_packages"][0]["compiled_extensions"],
+            ["pack/_core.cpython-313-x86_64-linux-gnu.so"],
+        )
+
+    async def test_an_older_phantom_without_a_runtime_still_publishes(self):
+        job = self._job("job-runtime-unknown")
+
+        async def fake_request(_method, path, _config, *_args, **_kwargs):
+            if path == "/targets":
+                return {"targets": [{"workflow_id": "wf-1"}]}
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        self._stub(
+            [
+                {
+                    "cnr_id": "pack",
+                    "class_types": ["Node"],
+                    "archive_sha256": "c" * 64,
+                    "compiled_extensions": ["pack/_core.cpython-313-x86_64-linux-gnu.so"],
+                }
+            ],
+            fake_request,
+        )
+        await publisher._run_publish("job-runtime-unknown", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "completed", job.get("error"))
+
+
 class StagedVariationTests(unittest.IsolatedAsyncioTestCase):
     """
     A new variation learns its id from the publish that created it. The panel
