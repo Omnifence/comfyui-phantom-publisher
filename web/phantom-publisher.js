@@ -362,6 +362,7 @@ const dependencyStatus = {
 };
 
 const dependencyKind = {
+  python_source: 'Python source',
   model: 'Model',
   external_model: 'External model',
   custom_node: 'Custom node',

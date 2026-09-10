@@ -10,6 +10,9 @@ import threading
 import time
 import types
 import unittest
+from unittest.mock import patch
+import json
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -530,8 +533,6 @@ class DesktopInstallTests(unittest.TestCase):
         self.assertEqual(publisher._comfy_source_root(), env.root.resolve())
 
 
-
-
 class GitMetadataTests(unittest.TestCase):
     """
     `git -C` walks up until it finds A repository, not THIS package's: a
@@ -821,7 +822,8 @@ class PipDependencyCaptureTests(unittest.TestCase):
 class _installed:
     """Pin importlib.metadata to a fixed installed set for the duration."""
 
-    def __init__(self, mapping: dict[str, tuple[str, str]]):
+    def __init__(self, mapping: dict[str, tuple[str, str]], direct_urls=None):
+        self._direct_urls = direct_urls or {}
         self._mapping = mapping
 
     def __enter__(self):
@@ -840,7 +842,13 @@ class _installed:
         }
         publisher.importlib.metadata.version = version
         publisher.importlib.metadata.distributions = lambda: [
-            types.SimpleNamespace(metadata={"Name": name}, version=release)
+            types.SimpleNamespace(
+                metadata={"Name": name},
+                version=release,
+                read_text=lambda _, name=name: (
+                    json.dumps(self._direct_urls[name]) if name in self._direct_urls else None
+                ),
+            )
             for name, release in versions.items()
         ]
         return self
@@ -2293,6 +2301,16 @@ class CancelPublishTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiscoveryCancellationTests(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        lock = patch.object(
+            publisher,
+            "_environment_lock",
+            return_value={"distributions": {}, "modules": {}, "sources": {}},
+        )
+        lock.start()
+        self.addCleanup(lock.stop)
+
     """
     Cancelling the publish task ends the await, not the worker thread. Model
     hashing, package archiving and Hugging Face downloads all run in one, so a
@@ -2709,6 +2727,16 @@ class CompiledExtensionTests(unittest.TestCase):
 
 
 class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        lock = patch.object(
+            publisher,
+            "_environment_lock",
+            return_value={"distributions": {}, "modules": {}, "sources": {}},
+        )
+        lock.start()
+        self.addCleanup(lock.stop)
+
     def _job(self, job_id: str) -> dict[str, Any]:
         job = {
             "job_id": job_id,
@@ -2836,6 +2864,43 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
             ["pack/_core.cpython-313-x86_64-linux-gnu.so"],
         )
 
+    async def test_checkout_manifest_upload_and_cleanup(self):
+        job = self._job("job-python-checkout")
+        manifests, uploaded = [], []
+
+        async def request(method, path, config, body=None, **kwargs):
+            if path == "/versions":
+                manifests.append(body["manifest"])
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        async def upload(version_id, digest, path, config, size, **kwargs):
+            self.assertTrue(path.is_file())
+            uploaded.append(path)
+            return True
+
+        self._stub([], request)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sam3"
+            path.mkdir()
+            (path / "setup.py").write_text("setup()")
+            lock = {
+                "distributions": {"sam3": "0.1"},
+                "modules": {},
+                "sources": {"sam3": {"kind": "dir", "editable": True, "_local_path": str(path)}},
+            }
+            with (
+                patch.object(publisher, "_environment_lock", return_value=lock),
+                patch.object(publisher, "_upload", side_effect=upload),
+            ):
+                await publisher._run_publish("job-python-checkout", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        source = manifests[0]["comfyui"]["environment"]["sources"]["sam3"]
+        self.assertEqual(len(source["archive_sha256"]), 64)
+        self.assertNotIn("_local_path", source)
+        self.assertEqual(job["dependencies"][0]["status"], "reused")
+        self.assertEqual(len(uploaded), 1)
+        self.assertFalse(uploaded[0].exists())
+
     async def test_an_older_phantom_without_a_runtime_still_publishes(self):
         job = self._job("job-runtime-unknown")
 
@@ -2860,6 +2925,16 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StagedVariationTests(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        lock = patch.object(
+            publisher,
+            "_environment_lock",
+            return_value={"distributions": {}, "modules": {}, "sources": {}},
+        )
+        lock.start()
+        self.addCleanup(lock.stop)
+
     """
     A new variation learns its id from the publish that created it. The panel
     writes that id into the graph, so the next publish updates that variation
@@ -2967,3 +3042,100 @@ class _StubRequest:
 
     async def json(self) -> dict[str, Any]:
         return self._body
+
+
+class InstallSourceTests(unittest.TestCase):
+    def source(self, value):
+        return publisher._install_source(
+            types.SimpleNamespace(read_text=lambda _: json.dumps(value))
+        )
+
+    def test_sources_and_credentials(self):
+        vcs = self.source(
+            {
+                "url": "https://user:secret@github.com/meta/sam3",
+                "vcs_info": {"vcs": "git", "commit_id": "a" * 40},
+            }
+        )
+        self.assertEqual(vcs["url"], "https://github.com/meta/sam3")
+        self.assertEqual(vcs["kind"], "vcs")
+        directory = self.source({"url": "file:///tmp/my%20lib", "dir_info": {"editable": True}})
+        self.assertEqual(directory["_local_path"], "/tmp/my lib")
+        self.assertTrue(directory["editable"])
+        self.assertIsNone(self.source({"url": "https://example.com/x", "dir_info": {}}))
+        for info in [{"hashes": {"sha256": "abc"}}, {"hash": "sha256=abc"}]:
+            self.assertEqual(
+                self.source({"url": "https://example.com/a.whl", "archive_info": info})["hashes"],
+                {"sha256": "abc"},
+            )
+        self.assertIsNone(self.source({"url": "file:///tmp/a.whl", "archive_info": {}}))
+        self.assertIsNone(
+            self.source({"url": "https://example.com/repo", "vcs_info": {"vcs": "git"}})
+        )
+
+    def test_bad_metadata_is_ignored(self):
+        for value in [None, "{bad json"]:
+            self.assertIsNone(
+                publisher._install_source(types.SimpleNamespace(read_text=lambda _: value))
+            )
+        self.assertIsNone(
+            publisher._install_source(types.SimpleNamespace(read_text=lambda _: 1 / 0))
+        )
+
+    def test_lock_keeps_versions_and_normalizes_sources(self):
+        with _installed(
+            {"sam": ("SAM_3", "0.1"), "plain": ("plain", "1")},
+            {
+                "SAM_3": {
+                    "url": "https://example.com/repo",
+                    "vcs_info": {"vcs": "git", "commit_id": "a" * 40},
+                }
+            },
+        ):
+            lock = publisher._environment_lock()
+            self.assertEqual(list(lock["sources"]), ["sam-3"])
+            with patch.object(publisher, "_install_source", side_effect=RuntimeError("broken")):
+                self.assertEqual(
+                    publisher._environment_lock()["distributions"], lock["distributions"]
+                )
+        with _installed({"plain": ("plain", "1")}):
+            self.assertEqual(publisher._environment_lock()["sources"], {})
+
+
+class PythonSourceArchiveTests(unittest.TestCase):
+    def test_reproducibility_exclusions_progress_and_missing_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lib"
+            path.mkdir()
+            (path / "setup.py").write_text("setup()")
+            for name in ["build", ".venv", "lib.egg-info", ".git", "__pycache__"]:
+                (path / name).mkdir()
+                (path / name / "junk").write_text("ignored")
+
+            def lock():
+                return {
+                    "distributions": {"lib": "1"},
+                    "sources": {"lib": {"kind": "dir", "editable": True, "_local_path": str(path)}},
+                }
+
+            first = lock()
+            items = publisher._archive_python_sources(first)
+            second = publisher._archive_python_sources(lock())
+            for item in items + second:
+                self.addCleanup(
+                    shutil.rmtree, Path(item["_archive_path"]).parent, ignore_errors=True
+                )
+            self.assertEqual(items[0]["archive_sha256"], second[0]["archive_sha256"])
+            self.assertNotIn("_local_path", first["sources"]["lib"])
+            with tarfile.open(items[0]["_archive_path"]) as archive:
+                self.assertEqual(archive.getnames(), ["lib/setup.py"])
+            dependencies, uploads = publisher._dependency_progress([], [], items)
+            self.assertEqual(dependencies[0]["kind"], "python_source")
+            self.assertEqual(uploads[0][0], items[0]["archive_sha256"])
+            with patch.object(publisher, "_PYTHON_SOURCE_MAX_BYTES", 1):
+                with self.assertRaisesRegex(RuntimeError, "lib.*Move data out.*PyPI or git"):
+                    publisher._archive_python_sources(lock())
+            shutil.rmtree(path)
+            missing = lock()
+            self.assertEqual(publisher._archive_python_sources(missing), [])
+            self.assertEqual(missing["sources"], {})
