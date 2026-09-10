@@ -78,6 +78,12 @@ workflow fills it in.
 - For each package, the paths of its compiled Python extensions (`.so`,
   `.pyd`, `.dylib`).
 
+Python dependency locks also capture install sources: Git dependencies keep their exact
+commit and archive installs keep their URL. Local checkouts are archived and uploaded
+automatically (up to 200 MB each, excluding build outputs, caches and virtual
+environments), then installed non-editably in the image. Index installs keep their
+exact version pins. This reproduces code whose version number alone is ambiguous.
+
 Before anything uploads, the publisher checks each package's compiled
 extensions (`.so`, `.pyd`, `.dylib`). Phantom builds the workflow's image for
 whichever Python those binaries need, so a package built for a newer Python

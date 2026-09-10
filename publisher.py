@@ -19,6 +19,8 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +32,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.9.0"
+PUBLISHER_VERSION = "0.10.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -810,6 +812,129 @@ def _pip_dependencies(
     return sorted(pinned.values())
 
 
+def _install_source(distribution: Any) -> dict[str, Any] | None:
+    """Read PEP 610 on Python 3.10+, independently of distribution metadata."""
+    try:
+        data = json.loads(distribution.read_text("direct_url.json") or "null")
+        if not isinstance(data, dict):
+            return None
+        url = data.get("url", "")
+        vcs = data.get("vcs_info")
+        if isinstance(vcs, dict):
+            if not vcs.get("commit_id"):
+                return None
+            return {
+                "kind": "vcs",
+                "url": _safe_url(url),
+                "vcs": vcs.get("vcs"),
+                "commit_id": vcs["commit_id"],
+                "requested_revision": vcs.get("requested_revision"),
+                "subdirectory": data.get("subdirectory"),
+            }
+        directory = data.get("dir_info")
+        if isinstance(directory, dict):
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+                return None
+            return {
+                "kind": "dir",
+                "editable": bool(directory.get("editable")),
+                "subdirectory": data.get("subdirectory"),
+                "_local_path": urllib.request.url2pathname(parsed.path),
+            }
+        archive = data.get("archive_info")
+        if isinstance(archive, dict) and not url.startswith("file:"):
+            hashes = archive.get("hashes")
+            if not hashes and isinstance(archive.get("hash"), str) and "=" in archive["hash"]:
+                algorithm, digest = archive["hash"].split("=", 1)
+                hashes = {algorithm: digest}
+            return {"kind": "archive", "url": _safe_url(url), "hashes": hashes or {}}
+    except Exception:
+        pass
+    return None
+
+
+_PYTHON_SOURCE_EXCLUSIONS = {
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+}
+_PYTHON_SOURCE_MAX_BYTES = 200 * 1024 * 1024
+
+
+def _source_files(directory: Path, excluded_dirs: set[str]):
+    for current, directories, files in os.walk(directory):
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name not in excluded_dirs and not name.endswith(".egg-info")
+        )
+        for name in sorted(directories + files):
+            yield Path(current) / name
+
+
+def _archive_python_sources(
+    lock: dict[str, Any], cancellation: threading.Event | None = None
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    try:
+        for name, source in list(lock.get("sources", {}).items()):
+            _stop_if_cancelled(cancellation)
+            if source.get("kind") != "dir":
+                continue
+            local = source.pop("_local_path", None)
+            path = Path(local) if local else None
+            if path is None or not path.is_dir():
+                del lock["sources"][name]
+                logging.getLogger(__name__).warning(
+                    "Python source %s at %s is missing; using the index", name, local
+                )
+                continue
+            size = 0
+            for entry in _source_files(path, _PYTHON_SOURCE_EXCLUSIONS):
+                _stop_if_cancelled(cancellation)
+                if entry.is_file():
+                    size += entry.stat().st_size
+                if size > _PYTHON_SOURCE_MAX_BYTES:
+                    raise RuntimeError(
+                        f"Python distribution {name} checkout at {path} is {size} bytes (limit 200 MB). Move data out of the checkout, or install from PyPI or git."
+                    )
+            archive, digest, byte_size = _archive_package(
+                path, cancellation, excluded_dirs=_PYTHON_SOURCE_EXCLUSIONS
+            )
+            items.append(
+                {
+                    "distribution": name,
+                    "version": lock["distributions"][name],
+                    "path": str(path),
+                    "archive_sha256": digest,
+                    "byte_size": byte_size,
+                    "_archive_path": str(archive),
+                }
+            )
+            if byte_size > _PYTHON_SOURCE_MAX_BYTES:
+                raise RuntimeError(
+                    f"Python distribution {name} checkout at {path} archive is {byte_size} bytes (limit 200 MB). Move data out of the checkout, or install from PyPI or git."
+                )
+            source.update(archive_sha256=digest, byte_size=byte_size)
+        return items
+    except BaseException:
+        for archive in _python_source_archives(items):
+            shutil.rmtree(archive.parent, ignore_errors=True)
+        raise
+
+
+def _python_source_archives(items: list[dict[str, Any]]) -> list[Path]:
+    return [Path(item["_archive_path"]) for item in items]
+
+
 def _environment_lock() -> dict[str, Any]:
     """
     The publishing venv, as a lock Phantom can heal a build from.
@@ -827,6 +952,7 @@ def _environment_lock() -> dict[str, Any]:
     the class check surfaces it, instead of failing on a guess.
     """
     distributions: dict[str, str] = {}
+    sources: dict[str, Any] = {}
     try:
         installed = list(importlib.metadata.distributions())
     except Exception:
@@ -841,7 +967,14 @@ def _environment_lock() -> dict[str, Any]:
         except Exception:
             continue
         if isinstance(name, str) and name and isinstance(version, str) and version:
-            distributions.setdefault(_normalize_distribution(name), version)
+            normalized = _normalize_distribution(name)
+            distributions.setdefault(normalized, version)
+            try:
+                source = _install_source(distribution)
+                if source:
+                    sources.setdefault(normalized, source)
+            except Exception:
+                pass
     try:
         module_to_distributions = importlib.metadata.packages_distributions()
     except Exception:
@@ -854,6 +987,7 @@ def _environment_lock() -> dict[str, Any]:
     return {
         "distributions": dict(sorted(distributions.items())),
         "modules": dict(sorted(modules.items())),
+        "sources": dict(sorted(sources.items())),
     }
 
 
@@ -1142,11 +1276,16 @@ def _trace_imports(
 
 
 def _archive_package(
-    directory: Path, cancellation: threading.Event | None = None
+    directory: Path,
+    cancellation: threading.Event | None = None,
+    *,
+    excluded_dirs: set[str] | None = None,
 ) -> tuple[Path, str, int]:
     temporary = Path(tempfile.mkdtemp(prefix="phantom-publisher-")) / f"{directory.name}.tar.gz"
     try:
-        return _write_package_archive(directory, temporary, cancellation)
+        return _write_package_archive(
+            directory, temporary, cancellation, excluded_dirs=excluded_dirs
+        )
     except BaseException:
         # A half-written archive is known only here: the caller registers an
         # archive for deletion off the tuple this never returned.
@@ -1155,12 +1294,20 @@ def _archive_package(
 
 
 def _write_package_archive(
-    directory: Path, temporary: Path, cancellation: threading.Event | None
+    directory: Path,
+    temporary: Path,
+    cancellation: threading.Event | None,
+    *,
+    excluded_dirs: set[str] | None = None,
 ) -> tuple[Path, str, int]:
     with temporary.open("wb") as compressed:
         with gzip.GzipFile(filename="", mode="wb", fileobj=compressed, mtime=0) as gzip_file:
             with tarfile.open(fileobj=gzip_file, mode="w", format=tarfile.PAX_FORMAT) as archive:
-                for source in sorted(directory.rglob("*")):
+                for source in sorted(
+                    _source_files(directory, excluded_dirs)
+                    if excluded_dirs is not None
+                    else directory.rglob("*")
+                ):
                     _stop_if_cancelled(cancellation)
                     if ".git" in source.parts or "__pycache__" in source.parts:
                         continue
@@ -1656,7 +1803,9 @@ async def _phantom_request(
 
 
 def _dependency_progress(
-    models: list[dict[str, Any]], packages: list[dict[str, Any]]
+    models: list[dict[str, Any]],
+    packages: list[dict[str, Any]],
+    python_sources: list[dict[str, Any]] | tuple = (),
 ) -> tuple[list[dict[str, Any]], list[tuple[str, Path, int, dict[str, Any]]]]:
     dependencies: list[dict[str, Any]] = []
     uploads: list[tuple[str, Path, int, dict[str, Any]]] = []
@@ -1723,6 +1872,22 @@ def _dependency_progress(
                 )
             )
 
+    for index, source in enumerate(python_sources):
+        size = source["byte_size"]
+        item = {
+            "id": f"python-source-{index}",
+            "kind": "python_source",
+            "name": f"{source['distribution']}=={source['version']}",
+            "detail": f"Python distribution · local checkout {source['path']}",
+            "byte_size": size,
+            "uploaded_bytes": 0,
+            "progress": 0,
+            "status": "pending",
+            "upload_required": True,
+            "sha256": source["archive_sha256"],
+        }
+        dependencies.append(item)
+        uploads.append((source["archive_sha256"], Path(source["_archive_path"]), size, item))
     return dependencies, uploads
 
 
@@ -2035,7 +2200,29 @@ async def _run_publish(
                     "compiled extensions need. Every compiled extension in this publish "
                     "was checked against the workflow's other graphs.",
                 )
-        dependencies, uploads = _dependency_progress(models, packages)
+        environment = _environment_lock()
+        python_sources = await discover(
+            _archive_python_sources, environment, archives=_python_source_archives
+        )
+        checkouts = {item["distribution"]: item for item in python_sources}
+        for name, source in environment.get("sources", {}).items():
+            if source["kind"] == "vcs":
+                _job_log(
+                    job,
+                    f"{name} installed from git ({source['url']} @ {source['commit_id'][:12]}); Phantom will install that commit",
+                )
+            elif source["kind"] == "dir":
+                item = checkouts[name]
+                _job_log(
+                    job,
+                    f"{name} installed from a local checkout at {item['path']}; uploading it ({item['byte_size'] / 1024 / 1024:.1f} MB)",
+                )
+            else:
+                _job_log(
+                    job,
+                    f"{name} installed from archive {source['url']}; Phantom will install that source",
+                )
+        dependencies, uploads = _dependency_progress(models, packages, python_sources)
         total_upload_bytes = sum(size for _, _, size, _ in uploads)
         job.update(
             dependencies=dependencies,
@@ -2056,7 +2243,7 @@ async def _run_publish(
                 "frontend_version": None,
                 "publisher_version": PUBLISHER_VERSION,
                 "runtime": runtime,
-                "environment": _environment_lock(),
+                "environment": environment,
             },
             "workflow": {"api": api_workflow, "ui": ui_workflow},
             "node_packages": [

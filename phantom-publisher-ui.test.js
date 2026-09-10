@@ -238,3 +238,7 @@ describe('Phantom publisher variation graphs', () => {
     excludes(js, 'interface_mapping');
   });
 });
+
+it('labels uploaded Python sources', () => {
+  assert.match(js, /python_source: .Python source./);
+});
