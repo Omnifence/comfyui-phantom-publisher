@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2893,6 +2894,84 @@ class CompiledExtensionTests(unittest.TestCase):
         self.assertEqual(runtime["python_tag"], f"cp{sys.version_info[0]}{sys.version_info[1]}")
         self.assertIn("system", runtime)
         self.assertIn("machine", runtime)
+        # The CUDA stack rides in the same block, every key present even when
+        # this interpreter has no torch: Phantom reads the keys, not their presence.
+        for key in ("torch", "cuda", "cudnn", "driver", "gpu"):
+            self.assertIn(key, runtime)
+
+    @staticmethod
+    def _fake_torch(
+        version: str,
+        cuda: str | None,
+        cudnn: int | None,
+        devices: list[str],
+        current: int = 0,
+    ) -> Any:
+        return types.SimpleNamespace(
+            __version__=version,
+            version=types.SimpleNamespace(cuda=cuda),
+            backends=types.SimpleNamespace(
+                cudnn=types.SimpleNamespace(
+                    is_available=lambda: cudnn is not None, version=lambda: cudnn
+                )
+            ),
+            cuda=types.SimpleNamespace(
+                is_available=lambda: bool(devices),
+                current_device=lambda: current,
+                get_device_name=lambda index: devices[index],
+            ),
+        )
+
+    def test_gpu_runtime_records_torch_and_the_driver(self):
+        # Phantom builds the image FROM this platform, so torch's full version
+        # (build tag included), its CUDA and cuDNN, the GPU torch runs on and
+        # the driver underneath are what let it start from the same CUDA base
+        # and install the same torch.
+        fake_torch = self._fake_torch("2.10.0+cu128", "12.8", 91002, ["NVIDIA GeForce RTX 4090"])
+        smi = subprocess.CompletedProcess(args=[], returncode=0, stdout="580.65.06\n", stderr="")
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            publisher.subprocess, "run", return_value=smi
+        ) as run:
+            facts = publisher._gpu_runtime()
+        self.assertEqual(
+            facts,
+            {
+                "torch": "2.10.0+cu128",
+                "cuda": "12.8",
+                "cudnn": "91002",
+                "driver": "580.65.06",
+                "gpu": "NVIDIA GeForce RTX 4090",
+            },
+        )
+        # nvidia-smi is asked for the driver only; the GPU name comes from torch.
+        self.assertEqual(run.call_args.args[0][1], "--query-gpu=driver_version")
+
+    def test_gpu_runtime_names_the_gpu_torch_runs_on(self):
+        # A mixed host: nvidia-smi lists the cards in PCI order, ComfyUI was
+        # started with `--cuda-device 1`, so torch sees the second card only.
+        # The manifest must name the card the workflow ran on, not row zero.
+        fake_torch = self._fake_torch("2.10.0+cu128", "12.8", 91002, ["NVIDIA RTX A6000"])
+        smi = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="580.65.06\n580.65.06\n", stderr=""
+        )
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            publisher.subprocess, "run", return_value=smi
+        ):
+            facts = publisher._gpu_runtime()
+        self.assertEqual(facts["gpu"], "NVIDIA RTX A6000")
+        self.assertEqual(facts["driver"], "580.65.06")
+
+    def test_gpu_runtime_is_best_effort(self):
+        # A CPU torch names no CUDA and no GPU, and a machine without nvidia-smi
+        # records no driver; neither stops the publish.
+        fake_torch = self._fake_torch("2.10.0+cpu", None, None, [])
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            publisher.subprocess, "run", side_effect=FileNotFoundError("nvidia-smi")
+        ):
+            facts = publisher._gpu_runtime()
+        self.assertEqual(
+            facts, {"torch": "2.10.0+cpu", "cuda": None, "cudnn": None, "driver": None, "gpu": None}
+        )
 
 
 class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
@@ -3110,6 +3189,30 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         self._stub([], fake_request)
         with patch.object(publisher, "_environment_lock", side_effect=lock):
             await publisher._run_publish("job-lock-thread", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        self.assertEqual(len(seen), 1)
+        self.assertIsNot(seen[0][0], threading.main_thread())
+        self.assertIsInstance(seen[0][1], threading.Event)
+
+    async def test_the_runtime_is_probed_in_a_discovery_worker(self):
+        # The GPU facts shell out to nvidia-smi with a 10 s timeout. On the event
+        # loop a hung driver would freeze status polling and the cancel route
+        # for that long; in a worker the loop keeps serving.
+        job = self._job("job-runtime-thread")
+        seen: list[tuple[threading.Thread, Any]] = []
+
+        def runtime(cancellation=None):
+            seen.append((threading.current_thread(), cancellation))
+            return {"python": "3.13.1", "python_tag": "cp313", "system": "Linux", "machine": "x86_64"}
+
+        async def fake_request(_method, path, _config, *_args, **_kwargs):
+            if path == "/targets":
+                return {"targets": []}
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        self._stub([], fake_request)
+        with patch.object(publisher, "_runtime", side_effect=runtime):
+            await publisher._run_publish("job-runtime-thread", _PUBLISH_BODY)
         self.assertEqual(job["status"], "completed", job.get("error"))
         self.assertEqual(len(seen), 1)
         self.assertIsNot(seen[0][0], threading.main_thread())
