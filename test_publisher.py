@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -857,6 +859,173 @@ class _installed:
         publisher.importlib.metadata.packages_distributions = self._packages_distributions
         publisher.importlib.metadata.version = self._version
         publisher.importlib.metadata.distributions = self._distributions
+
+
+class _RecordEntry(str):
+    """One RECORD line as importlib.metadata hands it out: a path, its hash, its size, `locate()`."""
+
+    def __new__(cls, path: str, root: Path, content: bytes, *, size: int | None = None):
+        self = super().__new__(cls, path)
+        digest = hashlib.sha256(content).digest()
+        self.hash = types.SimpleNamespace(
+            mode="sha256", value=base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        )
+        self.size = len(content) if size is None else size
+        self._root = root
+        return self
+
+    def locate(self) -> Path:
+        return self._root / str(self)
+
+
+def _distribution_with_files(name: str, version: str, files: list[_RecordEntry]):
+    return types.SimpleNamespace(
+        metadata={"Name": name}, version=version, files=files, read_text=lambda _: None
+    )
+
+
+class ShadowedDistributionTests(unittest.TestCase):
+    """
+    Two wheels that unpack into one package directory: the lock must name the
+    one whose files are on disk, or the build reproduces pip's install order
+    rather than the venv.
+    """
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "onnxruntime" / "capi").mkdir(parents=True)
+
+    def _write(self, path: str, content: bytes) -> None:
+        (self.root / path).write_bytes(content)
+
+    def _venv(self, cpu_so: bytes, gpu_so: bytes, *, on_disk: bytes):
+        self._write("onnxruntime/__init__.py", b"shared")
+        self._write("onnxruntime/capi/_pybind_state.so", on_disk)
+        cpu = _distribution_with_files(
+            "onnxruntime",
+            "1.29.0",
+            [
+                _RecordEntry("onnxruntime/__init__.py", self.root, b"shared"),
+                _RecordEntry("onnxruntime/capi/_pybind_state.so", self.root, cpu_so),
+            ],
+        )
+        gpu = _distribution_with_files(
+            "onnxruntime-gpu",
+            "1.20.2",
+            [
+                _RecordEntry("onnxruntime/__init__.py", self.root, b"shared"),
+                _RecordEntry("onnxruntime/capi/_pybind_state.so", self.root, gpu_so),
+            ],
+        )
+        return [cpu, gpu]
+
+    def test_the_distribution_whose_files_are_on_disk_wins(self):
+        installed = self._venv(b"cpu build", b"gpu build, much larger", on_disk=b"gpu build, much larger")
+        self.assertEqual(publisher._shadowed_distributions(installed), {"onnxruntime"})
+        installed = self._venv(b"cpu build", b"gpu build, much larger", on_disk=b"cpu build")
+        self.assertEqual(publisher._shadowed_distributions(installed), {"onnxruntime-gpu"})
+
+    def test_equal_sizes_are_settled_by_hash(self):
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"gpu build")
+        self.assertEqual(publisher._shadowed_distributions(installed), {"onnxruntime"})
+
+    def test_a_shared_identical_file_does_not_make_either_the_owner(self):
+        # Only `__init__.py` is shared and both RECORDs match it: nothing is
+        # decided, both stay. Same when the contested file is missing entirely.
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"neither")
+        self.assertEqual(publisher._shadowed_distributions(installed), set())
+        (self.root / "onnxruntime" / "capi" / "_pybind_state.so").unlink()
+        self.assertEqual(publisher._shadowed_distributions(installed), set())
+
+    def test_a_distribution_that_owns_some_and_loses_some_is_kept(self):
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"gpu build")
+        self._write("onnxruntime/cpu_only.py", b"cpu owns this")
+        installed[0].files.append(_RecordEntry("onnxruntime/cpu_only.py", self.root, b"cpu owns this"))
+        installed[1].files.append(_RecordEntry("onnxruntime/cpu_only.py", self.root, b"gpu lost this"))
+        self.assertEqual(publisher._shadowed_distributions(installed), set())
+
+    def test_distributions_without_files_or_hashes_are_ignored(self):
+        bare = types.SimpleNamespace(metadata={"Name": "plain"}, version="1", files=None)
+        unhashed = _RecordEntry("onnxruntime/RECORD", self.root, b"")
+        unhashed.hash = None
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"gpu build")
+        installed[0].files.append(unhashed)
+        installed[1].files.append(unhashed)
+        broken = types.SimpleNamespace(metadata=None, version="1")
+        self.assertEqual(
+            publisher._shadowed_distributions([bare, broken, *installed]), {"onnxruntime"}
+        )
+
+    def test_the_lock_leaves_a_shadowed_distribution_out_and_names_it(self):
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"gpu build")
+        with _installed({"onnxruntime": ("onnxruntime", "1.29.0"), "timm": ("timm", "1.0.28")}):
+            publisher.importlib.metadata.distributions = lambda: [
+                *installed,
+                _distribution_with_files("timm", "1.0.28", []),
+            ]
+            publisher.importlib.metadata.packages_distributions = lambda: {
+                "onnxruntime": ["onnxruntime", "onnxruntime-gpu"],
+                "timm": ["timm"],
+            }
+            lock = publisher._environment_lock()
+        self.assertEqual(lock["distributions"], {"onnxruntime-gpu": "1.20.2", "timm": "1.0.28"})
+        self.assertEqual(lock["modules"], {"onnxruntime": ["onnxruntime-gpu"], "timm": ["timm"]})
+        self.assertEqual(lock["shadowed"], {"onnxruntime": "1.29.0"})
+
+    def test_a_failing_shadow_check_keeps_every_distribution(self):
+        with _installed({"cv2": ("opencv-python", "4.10.0.84")}):
+            with patch.object(publisher, "_shadowed_distributions", side_effect=RuntimeError("x")):
+                lock = publisher._environment_lock()
+        self.assertEqual(lock["distributions"], {"opencv-python": "4.10.0.84"})
+        self.assertEqual(lock["shadowed"], {})
+
+    def test_a_shared_console_script_buries_nothing(self):
+        # Two unrelated distributions each ship `bin/foo`; the last installed
+        # owns it. Their modules are untouched, so neither is shadowed — only
+        # files inside site-packages can bury a distribution.
+        site = self.root / "site-packages"
+        site.mkdir()
+        (self.root / "bin").mkdir()
+        self._write("bin/foo", b"#!python\nfrom two import main")
+        self._write("site-packages/one.py", b"one")
+        self._write("site-packages/two.py", b"two")
+        one = _distribution_with_files(
+            "one",
+            "1.0",
+            [
+                _RecordEntry("one.py", site, b"one"),
+                _RecordEntry("../bin/foo", site, b"#!python\nfrom one import main"),
+            ],
+        )
+        two = _distribution_with_files(
+            "two",
+            "1.0",
+            [
+                _RecordEntry("two.py", site, b"two"),
+                _RecordEntry("../bin/foo", site, b"#!python\nfrom two import main"),
+            ],
+        )
+        self.assertTrue(publisher._record_entry_is_live(two.files[1], {}))
+        self.assertEqual(publisher._shadowed_distributions([one, two]), set())
+
+    def test_a_cancelled_publish_stops_the_shadow_check(self):
+        # The check runs in a discovery worker; a set event must surface as
+        # `_DiscoveryCancelled` rather than be swallowed by the guards that
+        # keep one unreadable RECORD from emptying the lock.
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"gpu build")
+        cancellation = threading.Event()
+        cancellation.set()
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._shadowed_distributions(installed, cancellation)
+        cache: dict = {}
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._record_entry_is_live(installed[1].files[1], cache, cancellation)
+        with _installed({"onnxruntime": ("onnxruntime", "1.29.0")}):
+            publisher.importlib.metadata.distributions = lambda: installed
+            with self.assertRaises(publisher._DiscoveryCancelled):
+                publisher._environment_lock(cancellation)
 
 
 class EnvironmentLockTests(unittest.TestCase):
@@ -2922,6 +3091,29 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         )
         await publisher._run_publish("job-runtime-unknown", _PUBLISH_BODY)
         self.assertEqual(job["status"], "completed", job.get("error"))
+
+    async def test_the_environment_lock_is_taken_in_a_discovery_worker(self):
+        # The shadow check hashes native libraries; done on the event loop it
+        # would stall progress polling and the cancel route for the duration.
+        job = self._job("job-lock-thread")
+        seen: list[tuple[threading.Thread, Any]] = []
+
+        def lock(cancellation=None):
+            seen.append((threading.current_thread(), cancellation))
+            return {"distributions": {}, "modules": {}, "sources": {}}
+
+        async def fake_request(_method, path, _config, *_args, **_kwargs):
+            if path == "/targets":
+                return {"targets": []}
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        self._stub([], fake_request)
+        with patch.object(publisher, "_environment_lock", side_effect=lock):
+            await publisher._run_publish("job-lock-thread", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        self.assertEqual(len(seen), 1)
+        self.assertIsNot(seen[0][0], threading.main_thread())
+        self.assertIsInstance(seen[0][1], threading.Event)
 
 
 class StagedVariationTests(unittest.IsolatedAsyncioTestCase):

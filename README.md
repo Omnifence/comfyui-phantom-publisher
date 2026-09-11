@@ -84,6 +84,14 @@ automatically (up to 200 MB each, excluding build outputs, caches and virtual
 environments), then installed non-editably in the image. Index installs keep their
 exact version pins. This reproduces code whose version number alone is ambiguous.
 
+A distribution another distribution has buried is left out of the lock. Two
+wheels can unpack into one package directory (`onnxruntime` and
+`onnxruntime-gpu`, `opencv-python` and `opencv-python-headless`); the one pip
+installed last owns the files on disk, and only that one runs in this ComfyUI.
+Only files inside site-packages count: two unrelated distributions that ship a
+console script of the same name both stay. The lock names the buried ones under
+`shadowed` so the review page can say why they are absent.
+
 Before anything uploads, the publisher checks each package's compiled
 extensions (`.so`, `.pyd`, `.dylib`). Phantom builds the workflow's image for
 whichever Python those binaries need, so a package built for a newer Python
