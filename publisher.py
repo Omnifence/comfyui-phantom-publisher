@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import contextlib
 import gzip
 import hashlib
@@ -32,7 +33,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.10.0"
+PUBLISHER_VERSION = "0.11.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -935,6 +936,85 @@ def _python_source_archives(items: list[dict[str, Any]]) -> list[Path]:
     return [Path(item["_archive_path"]) for item in items]
 
 
+def _record_entry_is_live(entry: Any, cache: dict[tuple[str, str], str | None]) -> bool:
+    """
+    Whether the file a RECORD entry describes is the one on disk: same size
+    when RECORD recorded one, then the same hash. The size check settles most
+    contests without reading the file — the CPU and GPU builds of a native
+    library differ by hundreds of megabytes.
+    """
+    path = entry.locate()
+    if not os.path.isfile(path):
+        return False
+    size = getattr(entry, "size", None)
+    if isinstance(size, int) and os.path.getsize(path) != size:
+        return False
+    mode = str(entry.hash.mode)
+    key = (str(path), mode)
+    if key not in cache:
+        try:
+            digest = hashlib.new(mode)
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            cache[key] = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
+        except Exception:
+            cache[key] = None
+    return cache[key] is not None and cache[key] == str(entry.hash.value)
+
+
+def _shadowed_distributions(installed: list[Any]) -> set[str]:
+    """
+    Distributions another distribution buried. Two wheels can unpack into ONE
+    package directory — `onnxruntime` and `onnxruntime-gpu`, `opencv-python`
+    and `opencv-python-headless` — and each lists the shared files in its
+    RECORD, but the one pip installed last owns what is on disk. A lock naming
+    both reproduces whichever pip happens to install last on the build
+    machine, not this venv: `sdxl-realistic-basic` shipped with the CPU ONNX
+    Runtime over the GPU one and ReActor found no CUDAExecutionProvider.
+
+    A distribution is shadowed when it owns none of the files it shares with
+    another distribution and loses at least one. One that owns some and loses
+    some is kept: the venv is inconsistent and neither choice reproduces it.
+    """
+    claims: dict[str, list[tuple[str, Any]]] = {}
+    for distribution in installed:
+        try:
+            name = _normalize_distribution(distribution.metadata["Name"])
+            entries = distribution.files or []
+        except Exception:
+            continue
+        for entry in entries:
+            try:
+                # RECORD itself and byte-compiled files carry no hash.
+                if entry.hash is None:
+                    continue
+                claims.setdefault(str(entry), []).append((name, entry))
+            except Exception:
+                continue
+    cache: dict[tuple[str, str], str | None] = {}
+    owned: set[str] = set()
+    lost: set[str] = set()
+    for claimants in claims.values():
+        names = {claimant for claimant, _ in claimants}
+        if len(names) < 2:
+            continue
+        owners: set[str] = set()
+        for claimant, entry in claimants:
+            try:
+                if _record_entry_is_live(entry, cache):
+                    owners.add(claimant)
+            except Exception:
+                pass
+        # A file every claimant matches (an identical `__init__.py` in both
+        # wheels) decides nothing, and neither does one nobody matches.
+        if not owners or owners == names:
+            continue
+        owned.update(owners)
+        lost.update(names - owners)
+    return lost - owned
+
+
 def _environment_lock() -> dict[str, Any]:
     """
     The publishing venv, as a lock Phantom can heal a build from.
@@ -950,13 +1030,22 @@ def _environment_lock() -> dict[str, Any]:
     LOADS. An import a node makes only while a workflow executes reaches
     neither, and the lock is what lets the build resolve such a module when
     the class check surfaces it, instead of failing on a guess.
+
+    `shadowed` names the distributions left out because another distribution
+    owns their files on disk (see `_shadowed_distributions`); the build never
+    installs them, and the review page can say why they are absent.
     """
     distributions: dict[str, str] = {}
     sources: dict[str, Any] = {}
+    shadowed: dict[str, str] = {}
     try:
         installed = list(importlib.metadata.distributions())
     except Exception:
         installed = []
+    try:
+        buried = _shadowed_distributions(installed)
+    except Exception:
+        buried = set()
     for distribution in installed:
         # One distribution with unreadable metadata — a `.dist-info` an
         # interrupted install left half-written — must not empty the lock.
@@ -968,6 +1057,9 @@ def _environment_lock() -> dict[str, Any]:
             continue
         if isinstance(name, str) and name and isinstance(version, str) and version:
             normalized = _normalize_distribution(name)
+            if normalized in buried:
+                shadowed.setdefault(normalized, version)
+                continue
             distributions.setdefault(normalized, version)
             try:
                 source = _install_source(distribution)
@@ -988,6 +1080,7 @@ def _environment_lock() -> dict[str, Any]:
         "distributions": dict(sorted(distributions.items())),
         "modules": dict(sorted(modules.items())),
         "sources": dict(sorted(sources.items())),
+        "shadowed": dict(sorted(shadowed.items())),
     }
 
 
