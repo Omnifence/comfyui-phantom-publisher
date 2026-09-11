@@ -495,7 +495,7 @@ def _declared_requirements(directory: Path) -> set[str]:
     return declared
 
 
-def _runtime() -> dict[str, Any]:
+def _runtime(cancellation: threading.Event | None = None) -> dict[str, Any]:
     """
     The interpreter this ComfyUI runs, recorded in every manifest.
 
@@ -505,6 +505,11 @@ def _runtime() -> dict[str, Any]:
     builds every workflow of a target into ONE image with ONE Python, so the
     author has to know when a pack they run happily here can never import
     there. The runtime is what Phantom compares its image against.
+
+    Runs in a discovery worker (hence the unused `cancellation`): the GPU
+    facts shell out to `nvidia-smi`, which can hang on a wedged driver, and
+    a probe on the event loop would freeze status polling and the cancel
+    route for the whole timeout.
     """
     version = ".".join(str(part) for part in sys.version_info[:3])
     glibc = platform.libc_ver()[1] or None
@@ -522,10 +527,17 @@ def _gpu_runtime() -> dict[str, Any]:
     """
     The CUDA stack this ComfyUI runs on, from the torch already loaded in the
     process: torch's version with its build tag, the CUDA it was built for,
-    the cuDNN it links, and the driver and GPU underneath. Phantom builds the
-    image FROM this platform — the same CUDA base, the same torch — so what
-    runs here runs there. Every field is best-effort: a CPU torch or a missing
-    nvidia-smi records None, and Phantom falls back to torch's build tag.
+    the cuDNN it links, the GPU torch is running on, and the driver underneath.
+    Phantom builds the image FROM this platform — the same CUDA base, the same
+    torch — so what runs here runs there. Every field is best-effort: a CPU
+    torch or a missing nvidia-smi records None, and Phantom falls back to
+    torch's build tag.
+
+    The GPU is torch's current device, not nvidia-smi's first row. ComfyUI's
+    `--cuda-device` and `CUDA_VISIBLE_DEVICES` pick the device torch sees, and
+    nvidia-smi lists every physical GPU in PCI order regardless, so on a mixed
+    host row zero can be a card this workflow never touched. The driver is one
+    per host, so nvidia-smi's first row is the right answer for that alone.
     """
     facts: dict[str, Any] = {"torch": None, "cuda": None, "cudnn": None, "driver": None, "gpu": None}
     try:
@@ -535,20 +547,19 @@ def _gpu_runtime() -> dict[str, Any]:
         facts["cuda"] = torch.version.cuda or None
         cudnn = torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None
         facts["cudnn"] = str(cudnn) if cudnn else None
+        if torch.cuda.is_available():
+            facts["gpu"] = torch.cuda.get_device_name(torch.cuda.current_device()) or None
     except Exception:
         pass
     try:
         query = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         first = query.stdout.strip().splitlines()[0] if query.returncode == 0 and query.stdout.strip() else ""
-        if first:
-            driver, _, name = first.partition(",")
-            facts["driver"] = driver.strip() or None
-            facts["gpu"] = name.strip() or None
+        facts["driver"] = first.strip() or None
     except Exception:
         pass
     return facts
@@ -2320,7 +2331,7 @@ async def _run_publish(
             report_skipped_repository,
             archives=_external_model_archives,
         )
-        runtime = _runtime()
+        runtime = await discover(_runtime)
         target_runtime = await _target_runtime(body["workflow_id"], config)
         if target_runtime:
             _job_step(
