@@ -981,6 +981,52 @@ class ShadowedDistributionTests(unittest.TestCase):
         self.assertEqual(lock["distributions"], {"opencv-python": "4.10.0.84"})
         self.assertEqual(lock["shadowed"], {})
 
+    def test_a_shared_console_script_buries_nothing(self):
+        # Two unrelated distributions each ship `bin/foo`; the last installed
+        # owns it. Their modules are untouched, so neither is shadowed — only
+        # files inside site-packages can bury a distribution.
+        site = self.root / "site-packages"
+        site.mkdir()
+        (self.root / "bin").mkdir()
+        self._write("bin/foo", b"#!python\nfrom two import main")
+        self._write("site-packages/one.py", b"one")
+        self._write("site-packages/two.py", b"two")
+        one = _distribution_with_files(
+            "one",
+            "1.0",
+            [
+                _RecordEntry("one.py", site, b"one"),
+                _RecordEntry("../bin/foo", site, b"#!python\nfrom one import main"),
+            ],
+        )
+        two = _distribution_with_files(
+            "two",
+            "1.0",
+            [
+                _RecordEntry("two.py", site, b"two"),
+                _RecordEntry("../bin/foo", site, b"#!python\nfrom two import main"),
+            ],
+        )
+        self.assertTrue(publisher._record_entry_is_live(two.files[1], {}))
+        self.assertEqual(publisher._shadowed_distributions([one, two]), set())
+
+    def test_a_cancelled_publish_stops_the_shadow_check(self):
+        # The check runs in a discovery worker; a set event must surface as
+        # `_DiscoveryCancelled` rather than be swallowed by the guards that
+        # keep one unreadable RECORD from emptying the lock.
+        installed = self._venv(b"cpu build", b"gpu build", on_disk=b"gpu build")
+        cancellation = threading.Event()
+        cancellation.set()
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._shadowed_distributions(installed, cancellation)
+        cache: dict = {}
+        with self.assertRaises(publisher._DiscoveryCancelled):
+            publisher._record_entry_is_live(installed[1].files[1], cache, cancellation)
+        with _installed({"onnxruntime": ("onnxruntime", "1.29.0")}):
+            publisher.importlib.metadata.distributions = lambda: installed
+            with self.assertRaises(publisher._DiscoveryCancelled):
+                publisher._environment_lock(cancellation)
+
 
 class EnvironmentLockTests(unittest.TestCase):
     """
@@ -3045,6 +3091,29 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         )
         await publisher._run_publish("job-runtime-unknown", _PUBLISH_BODY)
         self.assertEqual(job["status"], "completed", job.get("error"))
+
+    async def test_the_environment_lock_is_taken_in_a_discovery_worker(self):
+        # The shadow check hashes native libraries; done on the event loop it
+        # would stall progress polling and the cancel route for the duration.
+        job = self._job("job-lock-thread")
+        seen: list[tuple[threading.Thread, Any]] = []
+
+        def lock(cancellation=None):
+            seen.append((threading.current_thread(), cancellation))
+            return {"distributions": {}, "modules": {}, "sources": {}}
+
+        async def fake_request(_method, path, _config, *_args, **_kwargs):
+            if path == "/targets":
+                return {"targets": []}
+            return {"workflow_version_id": "version-3", "version": 3}
+
+        self._stub([], fake_request)
+        with patch.object(publisher, "_environment_lock", side_effect=lock):
+            await publisher._run_publish("job-lock-thread", _PUBLISH_BODY)
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        self.assertEqual(len(seen), 1)
+        self.assertIsNot(seen[0][0], threading.main_thread())
+        self.assertIsInstance(seen[0][1], threading.Event)
 
 
 class StagedVariationTests(unittest.IsolatedAsyncioTestCase):

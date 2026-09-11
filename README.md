@@ -88,8 +88,9 @@ A distribution another distribution has buried is left out of the lock. Two
 wheels can unpack into one package directory (`onnxruntime` and
 `onnxruntime-gpu`, `opencv-python` and `opencv-python-headless`); the one pip
 installed last owns the files on disk, and only that one runs in this ComfyUI.
-The lock names the buried ones under `shadowed` so the review page can say why
-they are absent.
+Only files inside site-packages count: two unrelated distributions that ship a
+console script of the same name both stay. The lock names the buried ones under
+`shadowed` so the review page can say why they are absent.
 
 Before anything uploads, the publisher checks each package's compiled
 extensions (`.so`, `.pyd`, `.dylib`). Phantom builds the workflow's image for

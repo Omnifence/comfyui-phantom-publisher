@@ -24,7 +24,7 @@ import urllib.request
 import logging
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
 import aiohttp
@@ -936,12 +936,17 @@ def _python_source_archives(items: list[dict[str, Any]]) -> list[Path]:
     return [Path(item["_archive_path"]) for item in items]
 
 
-def _record_entry_is_live(entry: Any, cache: dict[tuple[str, str], str | None]) -> bool:
+def _record_entry_is_live(
+    entry: Any,
+    cache: dict[tuple[str, str], str | None],
+    cancellation: threading.Event | None = None,
+) -> bool:
     """
     Whether the file a RECORD entry describes is the one on disk: same size
     when RECORD recorded one, then the same hash. The size check settles most
     contests without reading the file — the CPU and GPU builds of a native
-    library differ by hundreds of megabytes.
+    library differ by hundreds of megabytes. A tie still reads the whole
+    file, so the read stops between chunks once the publish is cancelled.
     """
     path = entry.locate()
     if not os.path.isfile(path):
@@ -956,14 +961,19 @@ def _record_entry_is_live(entry: Any, cache: dict[tuple[str, str], str | None]) 
             digest = hashlib.new(mode)
             with open(path, "rb") as handle:
                 for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    _stop_if_cancelled(cancellation)
                     digest.update(chunk)
             cache[key] = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
+        except _DiscoveryCancelled:
+            raise
         except Exception:
             cache[key] = None
     return cache[key] is not None and cache[key] == str(entry.hash.value)
 
 
-def _shadowed_distributions(installed: list[Any]) -> set[str]:
+def _shadowed_distributions(
+    installed: list[Any], cancellation: threading.Event | None = None
+) -> set[str]:
     """
     Distributions another distribution buried. Two wheels can unpack into ONE
     package directory — `onnxruntime` and `onnxruntime-gpu`, `opencv-python`
@@ -976,6 +986,11 @@ def _shadowed_distributions(installed: list[Any]) -> set[str]:
     A distribution is shadowed when it owns none of the files it shares with
     another distribution and loses at least one. One that owns some and loses
     some is kept: the venv is inconsistent and neither choice reproduces it.
+
+    Only files inside site-packages count. A RECORD also lists what the wheel
+    put elsewhere — console scripts under `../../../bin/`, headers, data —
+    and two unrelated distributions can ship a script of the same name.
+    Losing that script leaves every module importable, so it buries nothing.
     """
     claims: dict[str, list[tuple[str, Any]]] = {}
     for distribution in installed:
@@ -989,6 +1004,8 @@ def _shadowed_distributions(installed: list[Any]) -> set[str]:
                 # RECORD itself and byte-compiled files carry no hash.
                 if entry.hash is None:
                     continue
+                if ".." in PurePosixPath(entry).parts:
+                    continue
                 claims.setdefault(str(entry), []).append((name, entry))
             except Exception:
                 continue
@@ -999,11 +1016,14 @@ def _shadowed_distributions(installed: list[Any]) -> set[str]:
         names = {claimant for claimant, _ in claimants}
         if len(names) < 2:
             continue
+        _stop_if_cancelled(cancellation)
         owners: set[str] = set()
         for claimant, entry in claimants:
             try:
-                if _record_entry_is_live(entry, cache):
+                if _record_entry_is_live(entry, cache, cancellation):
                     owners.add(claimant)
+            except _DiscoveryCancelled:
+                raise
             except Exception:
                 pass
         # A file every claimant matches (an identical `__init__.py` in both
@@ -1015,9 +1035,11 @@ def _shadowed_distributions(installed: list[Any]) -> set[str]:
     return lost - owned
 
 
-def _environment_lock() -> dict[str, Any]:
+def _environment_lock(cancellation: threading.Event | None = None) -> dict[str, Any]:
     """
-    The publishing venv, as a lock Phantom can heal a build from.
+    The publishing venv, as a lock Phantom can heal a build from. Runs in a
+    discovery worker: the shadow check reads RECORD files and can hash native
+    libraries, which must not stall the server's event loop.
 
     `distributions` is every installed distribution at its exact version, and
     `modules` maps each importable top-level module to the distribution(s) that
@@ -1043,7 +1065,9 @@ def _environment_lock() -> dict[str, Any]:
     except Exception:
         installed = []
     try:
-        buried = _shadowed_distributions(installed)
+        buried = _shadowed_distributions(installed, cancellation)
+    except _DiscoveryCancelled:
+        raise
     except Exception:
         buried = set()
     for distribution in installed:
@@ -2293,7 +2317,7 @@ async def _run_publish(
                     "compiled extensions need. Every compiled extension in this publish "
                     "was checked against the workflow's other graphs.",
                 )
-        environment = _environment_lock()
+        environment = await discover(_environment_lock)
         python_sources = await discover(
             _archive_python_sources, environment, archives=_python_source_archives
         )
