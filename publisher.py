@@ -33,7 +33,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.11.0"
+PUBLISHER_VERSION = "0.12.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -514,7 +514,44 @@ def _runtime() -> dict[str, Any]:
         "system": platform.system() or None,
         "machine": platform.machine() or None,
         "glibc": glibc,
+        **_gpu_runtime(),
     }
+
+
+def _gpu_runtime() -> dict[str, Any]:
+    """
+    The CUDA stack this ComfyUI runs on, from the torch already loaded in the
+    process: torch's version with its build tag, the CUDA it was built for,
+    the cuDNN it links, and the driver and GPU underneath. Phantom builds the
+    image FROM this platform — the same CUDA base, the same torch — so what
+    runs here runs there. Every field is best-effort: a CPU torch or a missing
+    nvidia-smi records None, and Phantom falls back to torch's build tag.
+    """
+    facts: dict[str, Any] = {"torch": None, "cuda": None, "cudnn": None, "driver": None, "gpu": None}
+    try:
+        import torch
+
+        facts["torch"] = torch.__version__
+        facts["cuda"] = torch.version.cuda or None
+        cudnn = torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None
+        facts["cudnn"] = str(cudnn) if cudnn else None
+    except Exception:
+        pass
+    try:
+        query = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        first = query.stdout.strip().splitlines()[0] if query.returncode == 0 and query.stdout.strip() else ""
+        if first:
+            driver, _, name = first.partition(",")
+            facts["driver"] = driver.strip() or None
+            facts["gpu"] = name.strip() or None
+    except Exception:
+        pass
+    return facts
 
 
 _COMPILED_EXTENSION_SUFFIX = re.compile(r"\.(so|pyd|dylib)$", re.IGNORECASE)
