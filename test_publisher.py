@@ -2878,10 +2878,16 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/phantom-publisher/publish")
         ]
 
+    @staticmethod
+    def _connection() -> str:
+        """The connection id the route stamps on a job started right now."""
+        return publisher._connection_id(publisher._read_config())
+
     async def test_a_second_publish_of_the_same_payload_joins_the_running_job(self):
         job = {
             "job_id": "job-first",
             "idempotency_key": "key-1",
+            "connection": self._connection(),
             "status": "uploading",
             "progress": 40,
             "message": "Uploading dependency 1 of 2",
@@ -2914,6 +2920,7 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
             "job_id": "job-first",
             "workflow_id": "wf-1",
             "idempotency_key": "key-1",
+            "connection": self._connection(),
             "status": "uploading",
             "logs": [],
         }
@@ -2940,6 +2947,7 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
             "job_id": "job-other",
             "workflow_id": "wf-other",
             "idempotency_key": "key-1",
+            "connection": self._connection(),
             "status": "uploading",
             "logs": [],
         }
@@ -2957,6 +2965,59 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.body["workflow_id"], "wf-1")
         publisher._jobs.pop(response.body["job_id"], None)
         publisher._job_tasks.pop(response.body["job_id"], None)
+
+    async def test_a_running_job_on_another_phantom_never_blocks_this_workflow(self):
+        # The author switched the connection mid-publish — a staging Phantom
+        # cloned from production carries the same workflow ids. The running
+        # job is pinned to the old connection and holds nothing in the new
+        # one, so the new publish must start rather than follow that job.
+        elsewhere = publisher._connection_id(
+            {"origin": "https://other-phantom.test", "token": "php_other"}
+        )
+        self.assertNotEqual(elsewhere, self._connection())
+        publisher._jobs["job-elsewhere"] = {
+            "job_id": "job-elsewhere",
+            "workflow_id": "wf-1",
+            "idempotency_key": "key-1",
+            "connection": elsewhere,
+            "status": "uploading",
+            "logs": [],
+        }
+        self.addCleanup(publisher._jobs.pop, "job-elsewhere", None)
+        self._running_task("job-elsewhere")
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = lambda coroutine: coroutine.close()
+        try:
+            # Same key AND same workflow: neither the join nor the 409 may fire
+            # across connections.
+            response = await self._publish_handler()(
+                _StubRequest({**_PUBLISH_BODY, "idempotency_key": "key-1"})
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertEqual(response.status, 202)
+        self.assertNotEqual(response.body["job_id"], "job-elsewhere")
+        self.assertEqual(response.body["connection"], self._connection())
+        publisher._jobs.pop(response.body["job_id"], None)
+        publisher._job_tasks.pop(response.body["job_id"], None)
+
+    def test_the_connection_id_names_origin_and_token_without_carrying_them(self):
+        production = {"origin": "https://phantom.test/", "token": "php_prod"}
+        self.assertEqual(
+            publisher._connection_id(production),
+            publisher._connection_id({"origin": "https://phantom.test", "token": "php_prod"}),
+        )
+        self.assertNotEqual(
+            publisher._connection_id(production),
+            publisher._connection_id({"origin": "https://phantom.test", "token": "php_other"}),
+        )
+        self.assertNotEqual(
+            publisher._connection_id(production),
+            publisher._connection_id({"origin": "https://staging.test", "token": "php_prod"}),
+        )
+        # The id travels to the browser in every progress answer.
+        self.assertNotIn("php_prod", publisher._connection_id(production))
+        self.assertNotIn("phantom.test", publisher._connection_id(production))
 
     async def test_a_finished_job_never_swallows_the_next_publish(self):
         publisher._jobs["job-done"] = {

@@ -2636,7 +2636,34 @@ async def _abandon_uploads(job: dict[str, Any], config: dict[str, Any]) -> None:
             )
 
 
-def _running_job_for(idempotency_key: str) -> dict[str, Any] | None:
+def _connection_id(config: dict[str, Any]) -> str:
+    """
+    One value naming the Phantom a publish talks to: its origin and its token.
+
+    `_run_publish` pins a job to the connection it started under, so a job on
+    another connection shares nothing with a new publish — not the API, not the
+    staged version, not the multipart uploads. A workflow id is only unique
+    within one Phantom (a staging environment cloned from production carries
+    the same ids), so every "is this workflow busy" question is asked per
+    connection. Hashed because the job travels to the browser in every
+    progress answer, and the token must not.
+    """
+    origin = str(config.get("origin") or "").rstrip("/")
+    token = str(config.get("token") or "")
+    return hashlib.sha256(f"{origin}\n{token}".encode("utf-8")).hexdigest()[:16]
+
+
+def _running_jobs_on(connection: str) -> Iterator[dict[str, Any]]:
+    """Every job still in flight against this connection."""
+    for job_id, task in _job_tasks.items():
+        if task is None or task.done():
+            continue
+        job = _jobs.get(job_id)
+        if job is not None and job.get("connection") == connection:
+            yield job
+
+
+def _running_job_for(idempotency_key: str, connection: str) -> dict[str, Any] | None:
     """
     The job already publishing this exact payload, if one is still running.
 
@@ -2649,16 +2676,13 @@ def _running_job_for(idempotency_key: str) -> dict[str, Any] | None:
     """
     if not idempotency_key:
         return None
-    for job_id, task in _job_tasks.items():
-        if task is None or task.done():
-            continue
-        job = _jobs.get(job_id)
-        if job is not None and job.get("idempotency_key") == idempotency_key:
+    for job in _running_jobs_on(connection):
+        if job.get("idempotency_key") == idempotency_key:
             return job
     return None
 
 
-def _running_job_for_workflow(workflow_id: str) -> dict[str, Any] | None:
+def _running_job_for_workflow(workflow_id: str, connection: str) -> dict[str, Any] | None:
     """
     The job still publishing this workflow, whatever payload it carries.
 
@@ -2668,14 +2692,14 @@ def _running_job_for_workflow(workflow_id: str) -> dict[str, Any] | None:
     it first turns the other's next part into NoSuchUpload — the first publish
     fails, and the workflow is left with an orphan version beside the one that
     landed. So a running publish of a workflow refuses another until it ends.
+
+    Only on the same connection: a publish running against another Phantom
+    holds no version and no upload that this one could collide with.
     """
     if not workflow_id:
         return None
-    for job_id, task in _job_tasks.items():
-        if task is None or task.done():
-            continue
-        job = _jobs.get(job_id)
-        if job is not None and job.get("workflow_id") == workflow_id:
+    for job in _running_jobs_on(connection):
+        if job.get("workflow_id") == workflow_id:
             return job
     return None
 
@@ -2747,14 +2771,15 @@ def register_routes() -> None:
             raise web.HTTPBadRequest(text=str(error)) from error
         idempotency_key = str(body.get("idempotency_key") or "").strip()
         workflow_id = str(body.get("workflow_id") or "").strip()
-        running = _running_job_for(idempotency_key)
+        connection = _connection_id(_read_config())
+        running = _running_job_for(idempotency_key, connection)
         if running is not None:
             _job_log(
                 running,
                 "A second publish of this graph joined the job already running.",
             )
             return web.json_response(running, status=202)
-        busy = _running_job_for_workflow(workflow_id)
+        busy = _running_job_for_workflow(workflow_id, connection)
         if busy is not None:
             _job_log(
                 busy,
@@ -2776,6 +2801,7 @@ def register_routes() -> None:
             "job_id": job_id,
             "workflow_id": workflow_id or None,
             "idempotency_key": idempotency_key or None,
+            "connection": connection,
             "status": "queued",
             "progress": 0,
             "message": "Waiting to start…",

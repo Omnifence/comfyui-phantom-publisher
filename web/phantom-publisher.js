@@ -728,8 +728,10 @@ const publish = async () => {
     );
     // Phantom assigns the variation id, and a new variation only learns its own
     // here. Written back so the next publish of this file updates that graph
-    // instead of adding another variation beside it.
-    if (finished?.variation?.variation_id && graphExtra.phantom.variation) {
+    // instead of adding another variation beside it. Not from a joined job: it
+    // published another graph, possibly another variation, and taking its id
+    // would make the next publish of THIS graph replace that one.
+    if (!job.joined_running && finished?.variation?.variation_id && graphExtra.phantom.variation) {
       graphExtra.phantom.variation = { ...graphExtra.phantom.variation, ...finished.variation };
     }
   } catch (error) {
