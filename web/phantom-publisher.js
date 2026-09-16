@@ -2,17 +2,52 @@ import { app } from '../../scripts/app.js';
 import { api } from '../../scripts/api.js';
 import { fingerprintPublishPayload, selectPendingIdempotencyKey } from './publish-idempotency.js';
 
+// A failure of the hop between this tab and the ComfyUI server, as opposed to
+// an answer from the publisher's own handler. `fetch` rejects with a TypeError
+// when the request never completes; a proxy in front of the server (RunPod's,
+// for one) answers an unreachable pod with an HTML gateway page instead.
+const isTransportError = (error) => error instanceof TypeError || error.transport === true;
+
+const transportError = (message, status) =>
+  Object.assign(new Error(message), { status, transport: true });
+
+// The publisher's handler always answers JSON. A body that is not JSON came
+// from something in front of it: a gateway page (502–504) or a proxy that
+// swallowed the answer, both transport. A non-JSON 4xx is an auth layer or
+// proxy rejecting the request outright, which no retry can change, so that
+// keeps its status and raw text like any other client error.
+const isGatewayStatus = (status) => status >= 502 && status <= 504;
+
 const request = async (path, options = {}) => {
   const response = await api.fetchApi(`/phantom-publisher${path}`, {
     ...options,
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
   });
   const text = await response.text();
-  const body = text ? JSON.parse(text) : {};
-  if (!response.ok)
-    throw new Error(body.message || body.error || text || `HTTP ${response.status}`);
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    if (response.ok || isGatewayStatus(response.status))
+      throw transportError(
+        `the ComfyUI server did not answer (HTTP ${response.status})`,
+        response.status,
+      );
+    body = {};
+  }
+  if (!response.ok) {
+    const message = body.message || body.error || text || `HTTP ${response.status}`;
+    if (isGatewayStatus(response.status)) throw transportError(message, response.status);
+    throw Object.assign(new Error(message), { status: response.status });
+  }
   return body;
 };
+
+// How long one poll keeps retrying before the tab gives up on the server. The
+// publish is a task of the ComfyUI server, so a dropped poll loses nothing but
+// the view of it; only a server that stays unreachable ends the dialog.
+const RECONNECT_WINDOW_MS = 120_000;
+const RECONNECT_MAX_DELAY_MS = 5_000;
 
 const field = (label, input) => {
   const wrapper = document.createElement('label');
@@ -519,8 +554,47 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
     if (logDetails.open) logList.scrollTop = logList.scrollHeight;
   };
 
+  // One poll, retried across a dropped connection. A transport failure shows
+  // as "Reconnecting" in place of the phase and never as a failed publish: the
+  // job is still running on the server, and the next answer replaces the
+  // phase text anyway. A 404 is not transport — the server forgot the job,
+  // which after a restart is the truth. The reconnect window opens at the
+  // first transport failure, not when the poll started: a laptop that sleeps
+  // through a pending request wakes to that request rejecting, and the time
+  // it spent asleep must not count as time spent failing to reconnect.
+  const pollJob = async () => {
+    let disconnectedAt = null;
+    let attempt = 0;
+    while (document.body.contains(modal.panel)) {
+      try {
+        const job = await request(`/jobs/${jobId}`);
+        phase.classList.remove('phantom-publisher-muted');
+        return job;
+      } catch (error) {
+        if (error.status === 404)
+          throw new Error(
+            'The ComfyUI server no longer knows this publish job — it may have restarted. Check the workflow in Phantom before you publish again.',
+          );
+        if (!isTransportError(error)) throw error;
+        disconnectedAt ??= Date.now();
+        if (Date.now() - disconnectedAt > RECONNECT_WINDOW_MS)
+          throw new Error(
+            `Lost the connection to the ComfyUI server while following the publish (${error.message}). The publish carries on in the server; press Publish again with the same graph to rejoin it.`,
+          );
+        attempt += 1;
+        phase.textContent = `Reconnecting to the ComfyUI server… (${error.message})`;
+        phase.classList.add('phantom-publisher-muted');
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(1000 * attempt, RECONNECT_MAX_DELAY_MS)),
+        );
+      }
+    }
+    return null;
+  };
+
   while (document.body.contains(modal.panel)) {
-    const job = await request(`/jobs/${jobId}`);
+    const job = await pollJob();
+    if (!job) break;
     phase.textContent = job.message || job.status.replaceAll('_', ' ');
     progress.value = job.progress || 0;
     progressValue.textContent = `${job.progress || 0}%`;
