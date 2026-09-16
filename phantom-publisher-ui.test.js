@@ -258,7 +258,22 @@ describe('Phantom publisher progress polling', () => {
     contains(js, 'RECONNECT_WINDOW_MS');
     matches(js, /error instanceof TypeError \|\| error\.transport === true/);
     // A gateway page from a proxy is a transport failure, not a job answer.
-    matches(js, /response\.status >= 502 && response\.status <= 504/);
+    matches(js, /const isGatewayStatus = \(status\) => status >= 502 && status <= 504/);
+    // A non-JSON 4xx (an auth layer or proxy refusing the request) keeps its
+    // status and raw text; only an ok or gateway response with a malformed
+    // body is a lost hop.
+    matches(
+      js,
+      /catch \{\s*if \(response\.ok \|\| isGatewayStatus\(response\.status\)\)\s*throw transportError\([\s\S]*?\);\s*body = \{\};/,
+    );
+    // The reconnect window opens at the first transport failure, so a poll
+    // that sat pending through a laptop's sleep still gets its retries.
+    matches(js, /let disconnectedAt = null;/);
+    matches(
+      js,
+      /disconnectedAt \?\?= Date\.now\(\);\s*if \(Date\.now\(\) - disconnectedAt > RECONNECT_WINDOW_MS\)/,
+    );
+    excludes(js, 'const startedAt = Date.now();');
     // A forgotten job is the truth after a server restart, never retried.
     matches(js, /error\.status === 404[\s\S]*?no longer knows this publish job/);
     contains(js, 'press Publish again with the same graph to rejoin it');

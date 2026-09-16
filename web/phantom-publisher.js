@@ -11,6 +11,13 @@ const isTransportError = (error) => error instanceof TypeError || error.transpor
 const transportError = (message, status) =>
   Object.assign(new Error(message), { status, transport: true });
 
+// The publisher's handler always answers JSON. A body that is not JSON came
+// from something in front of it: a gateway page (502–504) or a proxy that
+// swallowed the answer, both transport. A non-JSON 4xx is an auth layer or
+// proxy rejecting the request outright, which no retry can change, so that
+// keeps its status and raw text like any other client error.
+const isGatewayStatus = (status) => status >= 502 && status <= 504;
+
 const request = async (path, options = {}) => {
   const response = await api.fetchApi(`/phantom-publisher${path}`, {
     ...options,
@@ -21,15 +28,16 @@ const request = async (path, options = {}) => {
   try {
     body = text ? JSON.parse(text) : {};
   } catch {
-    throw transportError(
-      `the ComfyUI server did not answer (HTTP ${response.status})`,
-      response.status,
-    );
+    if (response.ok || isGatewayStatus(response.status))
+      throw transportError(
+        `the ComfyUI server did not answer (HTTP ${response.status})`,
+        response.status,
+      );
+    body = {};
   }
   if (!response.ok) {
     const message = body.message || body.error || text || `HTTP ${response.status}`;
-    if (response.status >= 502 && response.status <= 504)
-      throw transportError(message, response.status);
+    if (isGatewayStatus(response.status)) throw transportError(message, response.status);
     throw Object.assign(new Error(message), { status: response.status });
   }
   return body;
@@ -550,9 +558,12 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
   // as "Reconnecting" in place of the phase and never as a failed publish: the
   // job is still running on the server, and the next answer replaces the
   // phase text anyway. A 404 is not transport — the server forgot the job,
-  // which after a restart is the truth.
+  // which after a restart is the truth. The reconnect window opens at the
+  // first transport failure, not when the poll started: a laptop that sleeps
+  // through a pending request wakes to that request rejecting, and the time
+  // it spent asleep must not count as time spent failing to reconnect.
   const pollJob = async () => {
-    const startedAt = Date.now();
+    let disconnectedAt = null;
     let attempt = 0;
     while (document.body.contains(modal.panel)) {
       try {
@@ -565,7 +576,8 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
             'The ComfyUI server no longer knows this publish job — it may have restarted. Check the workflow in Phantom before you publish again.',
           );
         if (!isTransportError(error)) throw error;
-        if (Date.now() - startedAt > RECONNECT_WINDOW_MS)
+        disconnectedAt ??= Date.now();
+        if (Date.now() - disconnectedAt > RECONNECT_WINDOW_MS)
           throw new Error(
             `Lost the connection to the ComfyUI server while following the publish (${error.message}). The publish carries on in the server; press Publish again with the same graph to rejoin it.`,
           );
