@@ -23,6 +23,29 @@ describe('Phantom publisher idempotency', () => {
     );
   });
 
+  it('ignores the canvas viewport, so a scroll between two presses is the same publish', async () => {
+    const graph = { nodes: [{ id: 1 }], extra: { ds: { scale: 1, offset: [0, 0] } } };
+    const scrolled = { nodes: [{ id: 1 }], extra: { ds: { scale: 0.8, offset: [120, -40] } } };
+    const edited = { nodes: [{ id: 2 }], extra: { ds: { scale: 1, offset: [0, 0] } } };
+    const base = await fingerprintPublishPayload({ workflow_id: 'w', ui_workflow: graph });
+    assert.equal(
+      await fingerprintPublishPayload({ workflow_id: 'w', ui_workflow: scrolled }),
+      base,
+    );
+    assert.notEqual(
+      await fingerprintPublishPayload({ workflow_id: 'w', ui_workflow: edited }),
+      base,
+    );
+    // Other `extra` keys still count: the publisher's own target block lives there.
+    assert.notEqual(
+      await fingerprintPublishPayload({
+        workflow_id: 'w',
+        ui_workflow: { ...graph, extra: { ...graph.extra, phantom: { workflow_id: 'other' } } },
+      }),
+      base,
+    );
+  });
+
   it('rotates legacy raw-key storage because its content identity is unknown', () => {
     assert.equal(
       selectPendingIdempotencyKey('legacy-key', 'fingerprint', () => 'new-key'),

@@ -38,7 +38,7 @@ const request = async (path, options = {}) => {
   if (!response.ok) {
     const message = body.message || body.error || text || `HTTP ${response.status}`;
     if (isGatewayStatus(response.status)) throw transportError(message, response.status);
-    throw Object.assign(new Error(message), { status: response.status });
+    throw Object.assign(new Error(message), { status: response.status, body });
   }
   return body;
 };
@@ -710,6 +710,15 @@ const publish = async () => {
         ...publishPayload,
         idempotency_key: idempotencyKey,
       }),
+    }).catch((error) => {
+      // 409: a publish of this workflow is still running, with a different
+      // graph. The one running is what the author can act on — watch it or
+      // cancel it — so its progress opens in place of a failure dialog. The
+      // pending key for THIS graph is dropped: it named a version that was
+      // never staged, and the next press must fingerprint the graph afresh.
+      if (error.status !== 409 || !error.body?.job_id) throw error;
+      localStorage.removeItem(idempotencyStorageKey);
+      return { job_id: error.body.job_id, joined_running: true };
     });
     const finished = await showProgress(
       job.job_id,
@@ -719,8 +728,10 @@ const publish = async () => {
     );
     // Phantom assigns the variation id, and a new variation only learns its own
     // here. Written back so the next publish of this file updates that graph
-    // instead of adding another variation beside it.
-    if (finished?.variation?.variation_id && graphExtra.phantom.variation) {
+    // instead of adding another variation beside it. Not from a joined job: it
+    // published another graph, possibly another variation, and taking its id
+    // would make the next publish of THIS graph replace that one.
+    if (!job.joined_running && finished?.variation?.variation_id && graphExtra.phantom.variation) {
       graphExtra.phantom.variation = { ...graphExtra.phantom.variation, ...finished.variation };
     }
   } catch (error) {

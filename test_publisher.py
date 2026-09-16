@@ -1692,6 +1692,156 @@ class PublisherProgressTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class UploadReopenTests(unittest.IsolatedAsyncioTestCase):
+    """
+    The multipart upload Phantom hands out is shared by digest. A second
+    publish of the same file can complete it under this job, and the object
+    store expires one nobody finished. A part that finds it gone reopens the
+    upload instead of failing the publish.
+    """
+
+    def setUp(self):
+        self._original_request = publisher._phantom_request
+        self._original_session = getattr(publisher.aiohttp, "ClientSession", None)
+
+    def tearDown(self):
+        publisher._phantom_request = self._original_request
+        if self._original_session is None:
+            del publisher.aiohttp.ClientSession
+        else:
+            publisher.aiohttp.ClientSession = self._original_session
+
+    def _store(self, *, gone_on_part: int, reopened_answer: dict[str, Any]):
+        opened: list[int] = []
+        uploaded: list[int] = []
+
+        async def request(_method, path, _config, _body=None, **_options):
+            if path.endswith("/uploads"):
+                opened.append(1)
+                if len(opened) == 1:
+                    return {"reused": False, "part_size": 4, "uploaded_parts": []}
+                return reopened_answer
+            if "/parts/" in path:
+                return {"upload_url": f"https://uploads.test{path}"}
+            return {"ok": True}
+
+        class Response:
+            def __init__(self, status: int) -> None:
+                self.status = status
+                self.headers = {"ETag": "uploaded"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            async def text(self):
+                return "<Error><Code>NoSuchUpload</Code></Error>"
+
+        class Session:
+            def __init__(self, *, timeout=None, **_options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def put(self, url, *, data):
+                part_number = int(url.rsplit("/", 1)[1])
+                if len(opened) == 1 and part_number == gone_on_part:
+                    return Response(404)
+                uploaded.append(part_number)
+                return Response(200)
+
+        publisher._phantom_request = request
+        publisher.aiohttp.ClientSession = Session
+        return opened, uploaded
+
+    async def _upload(self) -> tuple[bool, list[tuple[int, int, bool]]]:
+        progress: list[tuple[int, int, bool]] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "artifact.bin"
+            artifact.write_bytes(b"0123456789")
+            was_reused = await publisher._upload(
+                "version-id",
+                "a" * 64,
+                artifact,
+                {"origin": "https://example.test", "token": "php_secret"},
+                10,
+                on_progress=lambda done, total, reused: progress.append((done, total, reused)),
+            )
+        return was_reused, progress
+
+    async def test_a_file_another_publish_finished_is_reused(self):
+        opened, uploaded = self._store(gone_on_part=2, reopened_answer={"reused": True})
+        was_reused, progress = await self._upload()
+        self.assertTrue(was_reused)
+        self.assertEqual(len(opened), 2)
+        self.assertEqual(uploaded, [1])
+        self.assertEqual(progress[-1], (10, 10, True))
+
+    async def test_an_expired_upload_resumes_from_what_the_fresh_one_holds(self):
+        opened, uploaded = self._store(
+            gone_on_part=2,
+            reopened_answer={
+                "reused": False,
+                "part_size": 4,
+                "uploaded_parts": [{"PartNumber": 1, "ETag": "kept"}],
+            },
+        )
+        was_reused, progress = await self._upload()
+        self.assertFalse(was_reused)
+        self.assertEqual(len(opened), 2)
+        # Part 1 went up before the upload vanished, was reported by the fresh
+        # upload, and was not sent again; parts 2 and 3 went to the new one.
+        self.assertEqual(uploaded, [1, 2, 3])
+        self.assertEqual(progress[-1], (10, 10, False))
+
+    async def test_an_upload_gone_twice_fails_the_publish(self):
+        opened: list[int] = []
+
+        async def request(_method, path, _config, _body=None, **_options):
+            if path.endswith("/uploads"):
+                opened.append(1)
+                return {"reused": False, "part_size": 4, "uploaded_parts": []}
+            return {"upload_url": f"https://uploads.test{path}"}
+
+        class Response:
+            status = 404
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            async def text(self):
+                return "<Error><Code>NoSuchUpload</Code></Error>"
+
+        class Session:
+            def __init__(self, *, timeout=None, **_options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def put(self, _url, *, data):
+                return Response()
+
+        publisher._phantom_request = request
+        publisher.aiohttp.ClientSession = Session
+        with self.assertRaises(publisher._UploadGone):
+            await self._upload()
+        self.assertEqual(len(opened), 2)
+
+
 class PhantomRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_bodyless_post_sends_an_empty_json_object(self):
         captured: dict[str, object] = {}
@@ -2144,6 +2294,65 @@ class TransientNetworkFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(self.sleeps, [])
         self.assertIn("SignatureDoesNotMatch", str(caught.exception))
+
+
+    async def test_a_part_signed_for_a_completed_upload_reports_the_upload_gone(self):
+        # Another publish of the same file completed the shared upload first.
+        # That is not a failed part to retry five times; the upload must be
+        # asked for again.
+        attempts: list[int] = []
+
+        async def request(_method, _path, _config, _body=None, **_options):
+            return {"upload_url": "https://uploads.test/part-295"}
+
+        class Response:
+            status = 404
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            async def text(self):
+                return (
+                    '<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchUpload'
+                    "</Code><Message>The specified multipart upload does not exist."
+                    "</Message></Error>"
+                )
+
+        class Session:
+            def __init__(self, *, timeout=None, **_options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def put(self, _url, *, data):
+                attempts.append(1)
+                return Response()
+
+        original_request = publisher._phantom_request
+        publisher._phantom_request = request
+        publisher.aiohttp.ClientSession = Session
+        try:
+            with self.assertRaises(publisher._UploadGone):
+                await publisher._put_part(
+                    "version-id",
+                    "a" * 64,
+                    295,
+                    b"0123",
+                    {"origin": "https://api.phantomrouter.ai", "token": "php_secret"},
+                )
+        finally:
+            publisher._phantom_request = original_request
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.sleeps, [])
 
 
 if __name__ == "__main__":
@@ -2669,10 +2878,16 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/phantom-publisher/publish")
         ]
 
+    @staticmethod
+    def _connection() -> str:
+        """The connection id the route stamps on a job started right now."""
+        return publisher._connection_id(publisher._read_config())
+
     async def test_a_second_publish_of_the_same_payload_joins_the_running_job(self):
         job = {
             "job_id": "job-first",
             "idempotency_key": "key-1",
+            "connection": self._connection(),
             "status": "uploading",
             "progress": 40,
             "message": "Uploading dependency 1 of 2",
@@ -2695,6 +2910,114 @@ class ConcurrentPublishTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.body["job_id"], "job-first")
         self.assertEqual(started, [])
         self.assertTrue(any("joined the job" in entry["message"] for entry in job["logs"]))
+
+    async def test_a_changed_graph_is_refused_while_the_workflow_still_publishes(self):
+        # A different key means a different graph. Staging it beside the
+        # running publish would race both jobs onto the same multipart uploads
+        # (one completes, the other's next part answers NoSuchUpload) and leave
+        # an orphan version behind. The running job is the answer instead.
+        job = {
+            "job_id": "job-first",
+            "workflow_id": "wf-1",
+            "idempotency_key": "key-1",
+            "connection": self._connection(),
+            "status": "uploading",
+            "logs": [],
+        }
+        publisher._jobs["job-first"] = job
+        self.addCleanup(publisher._jobs.pop, "job-first", None)
+        self._running_task("job-first")
+        started: list[Any] = []
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = started.append
+        try:
+            response = await self._publish_handler()(
+                _StubRequest({**_PUBLISH_BODY, "idempotency_key": "key-2"})
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertEqual(response.status, 409)
+        self.assertEqual(response.body["job_id"], "job-first")
+        self.assertIn("already running", response.body["message"])
+        self.assertEqual(started, [])
+        self.assertTrue(any("refused" in entry["message"] for entry in job["logs"]))
+
+    async def test_another_workflow_publishes_beside_a_running_job(self):
+        publisher._jobs["job-other"] = {
+            "job_id": "job-other",
+            "workflow_id": "wf-other",
+            "idempotency_key": "key-1",
+            "connection": self._connection(),
+            "status": "uploading",
+            "logs": [],
+        }
+        self.addCleanup(publisher._jobs.pop, "job-other", None)
+        self._running_task("job-other")
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = lambda coroutine: coroutine.close()
+        try:
+            response = await self._publish_handler()(
+                _StubRequest({**_PUBLISH_BODY, "idempotency_key": "key-2"})
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertEqual(response.status, 202)
+        self.assertEqual(response.body["workflow_id"], "wf-1")
+        publisher._jobs.pop(response.body["job_id"], None)
+        publisher._job_tasks.pop(response.body["job_id"], None)
+
+    async def test_a_running_job_on_another_phantom_never_blocks_this_workflow(self):
+        # The author switched the connection mid-publish — a staging Phantom
+        # cloned from production carries the same workflow ids. The running
+        # job is pinned to the old connection and holds nothing in the new
+        # one, so the new publish must start rather than follow that job.
+        elsewhere = publisher._connection_id(
+            {"origin": "https://other-phantom.test", "token": "php_other"}
+        )
+        self.assertNotEqual(elsewhere, self._connection())
+        publisher._jobs["job-elsewhere"] = {
+            "job_id": "job-elsewhere",
+            "workflow_id": "wf-1",
+            "idempotency_key": "key-1",
+            "connection": elsewhere,
+            "status": "uploading",
+            "logs": [],
+        }
+        self.addCleanup(publisher._jobs.pop, "job-elsewhere", None)
+        self._running_task("job-elsewhere")
+        original_create_task = publisher.asyncio.create_task
+        publisher.asyncio.create_task = lambda coroutine: coroutine.close()
+        try:
+            # Same key AND same workflow: neither the join nor the 409 may fire
+            # across connections.
+            response = await self._publish_handler()(
+                _StubRequest({**_PUBLISH_BODY, "idempotency_key": "key-1"})
+            )
+        finally:
+            publisher.asyncio.create_task = original_create_task
+        self.assertEqual(response.status, 202)
+        self.assertNotEqual(response.body["job_id"], "job-elsewhere")
+        self.assertEqual(response.body["connection"], self._connection())
+        publisher._jobs.pop(response.body["job_id"], None)
+        publisher._job_tasks.pop(response.body["job_id"], None)
+
+    def test_the_connection_id_names_origin_and_token_without_carrying_them(self):
+        production = {"origin": "https://phantom.test/", "token": "php_prod"}
+        self.assertEqual(
+            publisher._connection_id(production),
+            publisher._connection_id({"origin": "https://phantom.test", "token": "php_prod"}),
+        )
+        self.assertNotEqual(
+            publisher._connection_id(production),
+            publisher._connection_id({"origin": "https://phantom.test", "token": "php_other"}),
+        )
+        self.assertNotEqual(
+            publisher._connection_id(production),
+            publisher._connection_id({"origin": "https://staging.test", "token": "php_prod"}),
+        )
+        # The id travels to the browser in every progress answer.
+        self.assertNotIn("php_prod", publisher._connection_id(production))
+        self.assertNotIn("phantom.test", publisher._connection_id(production))
 
     async def test_a_finished_job_never_swallows_the_next_publish(self):
         publisher._jobs["job-done"] = {

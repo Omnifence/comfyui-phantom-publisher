@@ -279,3 +279,24 @@ describe('Phantom publisher progress polling', () => {
     contains(js, 'press Publish again with the same graph to rejoin it');
   });
 });
+
+describe('Phantom publisher concurrent publish', () => {
+  it('opens the running publish when the server refuses a second one for the workflow', () => {
+    // Two publishes of one workflow with different keys stage two versions
+    // and race on the same multipart uploads. The server answers 409 with
+    // the running job; the tab shows that job instead of "Publish failed".
+    matches(js, /error\.status !== 409 \|\| !error\.body\?\.job_id/);
+    matches(js, /return \{ job_id: error\.body\.job_id, joined_running: true \}/);
+    contains(js, 'status: response.status, body');
+  });
+
+  it('never adopts the variation id of a job that published another graph', () => {
+    // The refused tab may hold variation B while the running job publishes
+    // variation A. Writing A's id into B's graph makes the next publish of B
+    // replace A. A joined job's variation is not this graph's.
+    contains(
+      js,
+      '!job.joined_running && finished?.variation?.variation_id && graphExtra.phantom.variation',
+    );
+  });
+});
