@@ -242,3 +242,25 @@ describe('Phantom publisher variation graphs', () => {
 it('labels uploaded Python sources', () => {
   assert.match(js, /python_source: .Python source./);
 });
+
+describe('Phantom publisher progress polling', () => {
+  it('reconnects across a dropped poll instead of reporting a failed publish', () => {
+    // The publish is a task of the ComfyUI server. One poll lost on the hop
+    // from the tab (a RunPod proxy hiccup, a sleeping laptop) used to throw
+    // "Failed to fetch" straight into the "Publish failed" dialog while the
+    // server finalized the version and started the build regardless.
+    contains(js, 'const pollJob = async () =>');
+    matches(
+      js,
+      /while \(document\.body\.contains\(modal\.panel\)\) \{\s*const job = await pollJob\(\);/,
+    );
+    contains(js, 'Reconnecting to the ComfyUI server…');
+    contains(js, 'RECONNECT_WINDOW_MS');
+    matches(js, /error instanceof TypeError \|\| error\.transport === true/);
+    // A gateway page from a proxy is a transport failure, not a job answer.
+    matches(js, /response\.status >= 502 && response\.status <= 504/);
+    // A forgotten job is the truth after a server restart, never retried.
+    matches(js, /error\.status === 404[\s\S]*?no longer knows this publish job/);
+    contains(js, 'press Publish again with the same graph to rejoin it');
+  });
+});

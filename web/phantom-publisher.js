@@ -2,17 +2,44 @@ import { app } from '../../scripts/app.js';
 import { api } from '../../scripts/api.js';
 import { fingerprintPublishPayload, selectPendingIdempotencyKey } from './publish-idempotency.js';
 
+// A failure of the hop between this tab and the ComfyUI server, as opposed to
+// an answer from the publisher's own handler. `fetch` rejects with a TypeError
+// when the request never completes; a proxy in front of the server (RunPod's,
+// for one) answers an unreachable pod with an HTML gateway page instead.
+const isTransportError = (error) => error instanceof TypeError || error.transport === true;
+
+const transportError = (message, status) =>
+  Object.assign(new Error(message), { status, transport: true });
+
 const request = async (path, options = {}) => {
   const response = await api.fetchApi(`/phantom-publisher${path}`, {
     ...options,
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
   });
   const text = await response.text();
-  const body = text ? JSON.parse(text) : {};
-  if (!response.ok)
-    throw new Error(body.message || body.error || text || `HTTP ${response.status}`);
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    throw transportError(
+      `the ComfyUI server did not answer (HTTP ${response.status})`,
+      response.status,
+    );
+  }
+  if (!response.ok) {
+    const message = body.message || body.error || text || `HTTP ${response.status}`;
+    if (response.status >= 502 && response.status <= 504)
+      throw transportError(message, response.status);
+    throw Object.assign(new Error(message), { status: response.status });
+  }
   return body;
 };
+
+// How long one poll keeps retrying before the tab gives up on the server. The
+// publish is a task of the ComfyUI server, so a dropped poll loses nothing but
+// the view of it; only a server that stays unreachable ends the dialog.
+const RECONNECT_WINDOW_MS = 120_000;
+const RECONNECT_MAX_DELAY_MS = 5_000;
 
 const field = (label, input) => {
   const wrapper = document.createElement('label');
@@ -519,8 +546,43 @@ const showProgress = async (jobId, origin, workflowSlug, idempotencyStorageKey) 
     if (logDetails.open) logList.scrollTop = logList.scrollHeight;
   };
 
+  // One poll, retried across a dropped connection. A transport failure shows
+  // as "Reconnecting" in place of the phase and never as a failed publish: the
+  // job is still running on the server, and the next answer replaces the
+  // phase text anyway. A 404 is not transport — the server forgot the job,
+  // which after a restart is the truth.
+  const pollJob = async () => {
+    const startedAt = Date.now();
+    let attempt = 0;
+    while (document.body.contains(modal.panel)) {
+      try {
+        const job = await request(`/jobs/${jobId}`);
+        phase.classList.remove('phantom-publisher-muted');
+        return job;
+      } catch (error) {
+        if (error.status === 404)
+          throw new Error(
+            'The ComfyUI server no longer knows this publish job — it may have restarted. Check the workflow in Phantom before you publish again.',
+          );
+        if (!isTransportError(error)) throw error;
+        if (Date.now() - startedAt > RECONNECT_WINDOW_MS)
+          throw new Error(
+            `Lost the connection to the ComfyUI server while following the publish (${error.message}). The publish carries on in the server; press Publish again with the same graph to rejoin it.`,
+          );
+        attempt += 1;
+        phase.textContent = `Reconnecting to the ComfyUI server… (${error.message})`;
+        phase.classList.add('phantom-publisher-muted');
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(1000 * attempt, RECONNECT_MAX_DELAY_MS)),
+        );
+      }
+    }
+    return null;
+  };
+
   while (document.body.contains(modal.panel)) {
-    const job = await request(`/jobs/${jobId}`);
+    const job = await pollJob();
+    if (!job) break;
     phase.textContent = job.message || job.status.replaceAll('_', ' ');
     progress.value = job.progress || 0;
     progressValue.textContent = `${job.progress || 0}%`;
