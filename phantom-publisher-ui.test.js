@@ -279,3 +279,14 @@ describe('Phantom publisher progress polling', () => {
     contains(js, 'press Publish again with the same graph to rejoin it');
   });
 });
+
+describe('Phantom publisher concurrent publish', () => {
+  it('opens the running publish when the server refuses a second one for the workflow', () => {
+    // Two publishes of one workflow with different keys stage two versions
+    // and race on the same multipart uploads. The server answers 409 with
+    // the running job; the tab shows that job instead of "Publish failed".
+    matches(js, /error\.status !== 409 \|\| !error\.body\?\.job_id/);
+    matches(js, /return \{ job_id: error\.body\.job_id, joined_running: true \}/);
+    contains(js, 'status: response.status, body');
+  });
+});

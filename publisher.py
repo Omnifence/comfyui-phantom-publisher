@@ -33,7 +33,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.12.1"
+PUBLISHER_VERSION = "0.13.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -2061,6 +2061,17 @@ def _part_bytes(part_number: int, part_size: int, total_size: int) -> int:
     return min(part_size, max(0, total_size - ((part_number - 1) * part_size)))
 
 
+class _UploadGone(RuntimeError):
+    """
+    The object store no longer has the multipart upload a part was signed for.
+
+    Uploads are shared by digest, so another publish of the same file can
+    complete the one this job is writing to, and the store expires an upload
+    nobody finished. Either way the answer is the same: ask Phantom for the
+    upload again, and carry on from whatever it reports.
+    """
+
+
 async def _put_part(
     version_id: str,
     digest: str,
@@ -2097,6 +2108,11 @@ async def _put_part(
                         }
                     response_detail = (await response.text()).strip()
                     suffix = f": {response_detail[:500]}" if response_detail else ""
+                    if response.status == 404 and "NoSuchUpload" in response_detail:
+                        raise _UploadGone(
+                            f"Artifact part {part_number} was signed for a multipart "
+                            "upload the object store no longer has"
+                        )
                     retryable = response.status == 429 or response.status >= 500
                     if not retryable or last_attempt:
                         raise RuntimeError(
@@ -2128,44 +2144,58 @@ async def _upload(
     on_progress: Callable[[int, int, bool], None] | None = None,
     on_retry: Callable[[int, int, float], None] | None = None,
 ) -> bool:
-    started = await _phantom_request(
-        "POST",
-        f"/versions/{version_id}/artifacts/{digest}/uploads",
-        config,
-        {"byte_size": size},
-        transient_retries=_TRANSIENT_RETRIES,
-        on_retry=on_retry,
-    )
-    if started.get("reused"):
-        if on_progress:
-            on_progress(size, size, True)
-        return True
-    part_size = int(started["part_size"])
-    completed = {int(part["PartNumber"]): part for part in started.get("uploaded_parts", [])}
-    # Carried forward rather than re-summed per part: a 50 GB model is ~10 000
-    # parts, and re-adding every completed one on each is quadratic work spent
-    # to render a progress number.
-    uploaded_bytes = sum(
-        _part_bytes(part_number, part_size, size) for part_number in completed
-    )
-    if on_progress:
-        on_progress(uploaded_bytes, size, False)
-    with path.open("rb") as handle:
-        part_number = 1
-        while chunk := handle.read(part_size):
-            if part_number not in completed:
-                completed[part_number] = await _put_part(
-                    version_id,
-                    digest,
-                    part_number,
-                    chunk,
-                    config,
-                    on_retry=on_retry,
-                )
-                uploaded_bytes += len(chunk)
+    # Opened twice at most. The upload Phantom hands out is shared by digest,
+    # so it can be completed under this job by another publish of the same
+    # file, or expired by the object store. When a part finds it gone, the
+    # upload is asked for again: a file that is now verified is reused, and
+    # anything else resumes from the parts the fresh upload already holds.
+    for reopened in (False, True):
+        started = await _phantom_request(
+            "POST",
+            f"/versions/{version_id}/artifacts/{digest}/uploads",
+            config,
+            {"byte_size": size},
+            transient_retries=_TRANSIENT_RETRIES,
+            on_retry=on_retry,
+        )
+        if started.get("reused"):
             if on_progress:
-                on_progress(uploaded_bytes, size, False)
-            part_number += 1
+                on_progress(size, size, True)
+            return True
+        part_size = int(started["part_size"])
+        completed = {
+            int(part["PartNumber"]): part for part in started.get("uploaded_parts", [])
+        }
+        # Carried forward rather than re-summed per part: a 50 GB model is
+        # ~10 000 parts, and re-adding every completed one on each is quadratic
+        # work spent to render a progress number.
+        uploaded_bytes = sum(
+            _part_bytes(part_number, part_size, size) for part_number in completed
+        )
+        if on_progress:
+            on_progress(uploaded_bytes, size, False)
+        try:
+            with path.open("rb") as handle:
+                part_number = 1
+                while chunk := handle.read(part_size):
+                    if part_number not in completed:
+                        completed[part_number] = await _put_part(
+                            version_id,
+                            digest,
+                            part_number,
+                            chunk,
+                            config,
+                            on_retry=on_retry,
+                        )
+                        uploaded_bytes += len(chunk)
+                    if on_progress:
+                        on_progress(uploaded_bytes, size, False)
+                    part_number += 1
+        except _UploadGone:
+            if reopened:
+                raise
+            continue
+        break
     # Finalizing is the one request that can be retried for free: every part is
     # already in the object store, so a repeat sends no bytes.
     await _phantom_request(
@@ -2628,6 +2658,28 @@ def _running_job_for(idempotency_key: str) -> dict[str, Any] | None:
     return None
 
 
+def _running_job_for_workflow(workflow_id: str) -> dict[str, Any] | None:
+    """
+    The job still publishing this workflow, whatever payload it carries.
+
+    A second publish of the same workflow with a DIFFERENT key stages a second
+    version in Phantom while the first is still uploading. Both then reach the
+    same model file, resume the same multipart upload, and whichever completes
+    it first turns the other's next part into NoSuchUpload — the first publish
+    fails, and the workflow is left with an orphan version beside the one that
+    landed. So a running publish of a workflow refuses another until it ends.
+    """
+    if not workflow_id:
+        return None
+    for job_id, task in _job_tasks.items():
+        if task is None or task.done():
+            continue
+        job = _jobs.get(job_id)
+        if job is not None and job.get("workflow_id") == workflow_id:
+            return job
+    return None
+
+
 def register_routes() -> None:
     routes = PromptServer.instance.routes
 
@@ -2694,6 +2746,7 @@ def register_routes() -> None:
             # refused here — before a job exists and before a byte is read.
             raise web.HTTPBadRequest(text=str(error)) from error
         idempotency_key = str(body.get("idempotency_key") or "").strip()
+        workflow_id = str(body.get("workflow_id") or "").strip()
         running = _running_job_for(idempotency_key)
         if running is not None:
             _job_log(
@@ -2701,9 +2754,27 @@ def register_routes() -> None:
                 "A second publish of this graph joined the job already running.",
             )
             return web.json_response(running, status=202)
+        busy = _running_job_for_workflow(workflow_id)
+        if busy is not None:
+            _job_log(
+                busy,
+                "A publish of a changed graph was refused while this job runs.",
+            )
+            return web.json_response(
+                {
+                    "message": (
+                        "A publish of this workflow is already running. Wait for it "
+                        "to finish, or cancel it, before you publish the graph as it "
+                        "is now."
+                    ),
+                    "job_id": busy["job_id"],
+                },
+                status=409,
+            )
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
             "job_id": job_id,
+            "workflow_id": workflow_id or None,
             "idempotency_key": idempotency_key or None,
             "status": "queued",
             "progress": 0,
