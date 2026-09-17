@@ -3662,6 +3662,62 @@ class _StubRequest:
         return self._body
 
 
+class TargetRouteTests(unittest.IsolatedAsyncioTestCase):
+    """
+    A refusal from Phantom must reach the dialog as a message. An exception
+    that escapes the handler becomes aiohttp's own "500 Server got itself in
+    trouble" page, and the dialog shows that text in place of the reason.
+    """
+
+    @staticmethod
+    def _handler(method: str):
+        publisher.register_routes()
+        return publisher.PromptServer.instance.routes.handlers[(method, "/phantom-publisher/targets")]
+
+    async def _with_phantom(self, error, call):
+        original_request = publisher._phantom_request
+        original_config = publisher._read_config
+
+        async def failing(*_args, **_kwargs):
+            raise error
+
+        publisher._phantom_request = failing
+        publisher._read_config = lambda: {"origin": "https://api.example", "token": "php_x"}
+        try:
+            return await call()
+        finally:
+            publisher._phantom_request = original_request
+            publisher._read_config = original_config
+
+    async def test_a_rejected_slug_reaches_the_dialog_as_the_400_phantom_sent(self):
+        error = publisher.PhantomRequestError(
+            "Phantom POST /targets returned HTTP 400: body/slug must match pattern", 400
+        )
+        response = await self._with_phantom(
+            error,
+            lambda: self._handler("POST")(
+                _StubRequest({"name": "LTX", "slug": "ltx2.3_i2v", "provider": "runpod"})
+            ),
+        )
+        self.assertEqual(response.status, 400)
+        self.assertIn("must match pattern", response.body["message"])
+
+    async def test_an_unreachable_phantom_is_a_bad_gateway_not_a_publisher_crash(self):
+        error = publisher.PhantomRequestError("Phantom GET /targets could not reach https://api.example")
+        response = await self._with_phantom(
+            error, lambda: self._handler("GET")(_StubRequest({}))
+        )
+        self.assertEqual(response.status, 502)
+        self.assertIn("could not reach", response.body["message"])
+
+    async def test_a_phantom_5xx_is_forwarded_as_a_bad_gateway(self):
+        error = publisher.PhantomRequestError("Phantom GET /targets returned HTTP 503: down", 503)
+        response = await self._with_phantom(
+            error, lambda: self._handler("GET")(_StubRequest({}))
+        )
+        self.assertEqual(response.status, 502)
+
+
 class InstallSourceTests(unittest.TestCase):
     def source(self, value):
         return publisher._install_source(
