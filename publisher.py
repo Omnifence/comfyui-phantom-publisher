@@ -33,7 +33,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.13.0"
+PUBLISHER_VERSION = "0.13.1"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -1899,6 +1899,22 @@ def _backoff_seconds(attempt: int) -> float:
     return min(float(2**attempt), _MAX_BACKOFF_SECONDS)
 
 
+class PhantomRequestError(RuntimeError):
+    """
+    Phantom answered a request with an error, or could not be reached at all.
+
+    `status` is Phantom's HTTP status, or `None` when no answer arrived. A route
+    that forwards Phantom's answer straight to the browser needs the status to
+    keep a 4xx a 4xx: aiohttp turns any other exception that escapes a handler
+    into its own "500 Server got itself in trouble" page, and the dialog then
+    shows that text instead of the reason.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 async def _phantom_request(
     method: str,
     path: str,
@@ -1937,9 +1953,10 @@ async def _phantom_request(
                     payload = _parse_json_body(raw)
                     if response.status < 400:
                         if payload is None:
-                            raise RuntimeError(
+                            raise PhantomRequestError(
                                 f"Phantom {method.upper()} {path} returned HTTP "
-                                f"{response.status} with a non-JSON body: {raw.strip()[:200]}"
+                                f"{response.status} with a non-JSON body: {raw.strip()[:200]}",
+                                response.status,
                             )
                         return payload
                     message = (
@@ -1949,13 +1966,14 @@ async def _phantom_request(
                     ) or (raw.strip()[:200] or "Request failed")
                     retryable = response.status == 429 or response.status >= 500
                     if not retryable or last_attempt:
-                        raise RuntimeError(
+                        raise PhantomRequestError(
                             f"Phantom {method.upper()} {path} returned HTTP "
-                            f"{response.status}: {message}"
+                            f"{response.status}: {message}",
+                            response.status,
                         )
             except _TRANSIENT_NETWORK_ERRORS as error:
                 if last_attempt:
-                    raise RuntimeError(
+                    raise PhantomRequestError(
                         f"Phantom {method.upper()} {path} could not reach "
                         f"{config['origin']}: {error}"
                     ) from error
@@ -1964,7 +1982,20 @@ async def _phantom_request(
                 on_retry(attempt + 2, total_attempts, delay)
             await asyncio.sleep(delay)
 
-    raise RuntimeError(f"Phantom {method.upper()} {path} failed after {total_attempts} attempts")
+    raise PhantomRequestError(
+        f"Phantom {method.upper()} {path} failed after {total_attempts} attempts"
+    )
+
+
+def _phantom_error_response(error: PhantomRequestError) -> Any:
+    """
+    Phantom's refusal, as the JSON the dialog reads. A 4xx keeps its status —
+    the browser did something Phantom will not accept, and the message says
+    what. Anything else (Phantom down, unreachable, non-JSON) is a bad gateway:
+    the request was fine and the publisher could not get an answer for it.
+    """
+    status = error.status if error.status is not None and 400 <= error.status < 500 else 502
+    return web.json_response({"message": str(error)}, status=status)
 
 
 def _dependency_progress(
@@ -2752,11 +2783,21 @@ def register_routes() -> None:
 
     @routes.get("/phantom-publisher/targets")
     async def targets(_: web.Request) -> web.Response:
-        return web.json_response(await _phantom_request("GET", "/targets", _read_config()))
+        try:
+            return web.json_response(await _phantom_request("GET", "/targets", _read_config()))
+        except PhantomRequestError as error:
+            return _phantom_error_response(error)
 
     @routes.post("/phantom-publisher/targets")
     async def create_target(request: web.Request) -> web.Response:
-        return web.json_response(await _phantom_request("POST", "/targets", _read_config(), await request.json()))
+        # Phantom validates the name and slug (`^[a-z0-9][a-z0-9-]*$`). Its
+        # 400 must reach the dialog as the message, not as aiohttp's 500 page.
+        try:
+            return web.json_response(
+                await _phantom_request("POST", "/targets", _read_config(), await request.json())
+            )
+        except PhantomRequestError as error:
+            return _phantom_error_response(error)
 
     @routes.post("/phantom-publisher/publish")
     async def publish(request: web.Request) -> web.Response:

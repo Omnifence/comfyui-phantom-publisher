@@ -300,3 +300,25 @@ describe('Phantom publisher concurrent publish', () => {
     );
   });
 });
+
+describe('Phantom publisher new workflow slug', () => {
+  it("checks the slug against Phantom's rule before the request leaves the tab", () => {
+    // The server pattern, verbatim: `^[a-z0-9][a-z0-9-]*$`.
+    contains(js, 'const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/');
+    contains(js, 'if (!SLUG_PATTERN.test(slug.value))');
+    contains(js, 'slug.focus()');
+  });
+
+  it('derives the slug from the name until the author edits it', () => {
+    contains(js, 'slug.value = slugFromName(name.value)');
+    contains(js, 'slugEdited');
+    // "LTX2.3 Image 2 Video (I2V)" holds a dot, spaces and parentheses; the
+    // derived slug must hold none of them and must not start or end on a hyphen.
+    const source = js.match(/const slugFromName = \(name\) =>\n([\s\S]*?);\n/);
+    assert.ok(source, 'slugFromName is defined');
+    const slugFromName = new Function('name', `return ${source[1]}`);
+    assert.equal(slugFromName('LTX2.3 Image 2 Video (I2V)'), 'ltx2-3-image-2-video-i2v');
+    assert.equal(slugFromName('  Portrait generator  '), 'portrait-generator');
+    assert.equal(slugFromName('***'), '');
+  });
+});

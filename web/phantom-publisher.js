@@ -49,6 +49,22 @@ const request = async (path, options = {}) => {
 const RECONNECT_WINDOW_MS = 120_000;
 const RECONNECT_MAX_DELAY_MS = 5_000;
 
+// The slug becomes the workflow's model id `phantom/<slug>` and its URL, so
+// Phantom accepts only lowercase letters, digits and hyphens, starting with a
+// letter or digit. This is the server's pattern; a slug that fails it here
+// would fail there with the same rule.
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const SLUG_RULE = 'lowercase letters, digits and hyphens, starting with a letter or digit';
+
+// "LTX2.3 Image 2 Video (I2V)" → "ltx2-3-image-2-video-i2v". Every run of
+// characters the slug cannot hold becomes one hyphen, so a name always yields
+// something the server accepts, or nothing when it holds no usable character.
+const slugFromName = (name) =>
+  name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
 const field = (label, input) => {
   const wrapper = document.createElement('label');
   wrapper.className = 'phantom-publisher-field';
@@ -183,6 +199,15 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
   select.value = rememberedTarget?.workflow_id || '';
   const name = input('Portrait generator');
   const slug = input('portrait-generator');
+  // The slug follows the name until the author edits it by hand. A typed
+  // slug is theirs to keep; a derived one tracks every keystroke of the name.
+  let slugEdited = false;
+  name.oninput = () => {
+    if (!slugEdited) slug.value = slugFromName(name.value);
+  };
+  slug.oninput = () => {
+    slugEdited = slug.value !== '';
+  };
   const provider = document.createElement('select');
   provider.innerHTML = `<option value="runpod">RunPod</option><option value="vast-ai">Vast AI</option>`;
   const publishAs = document.createElement('select');
@@ -331,10 +356,20 @@ const chooseTarget = async (remembered, config = {}, rememberedVariation = null)
           resolve(selected);
           return;
         }
+        if (!name.value.trim()) {
+          status.textContent = 'A name is required for a new workflow.';
+          name.focus();
+          return;
+        }
+        if (!SLUG_PATTERN.test(slug.value)) {
+          status.textContent = `The slug must be ${SLUG_RULE}. Try "${slugFromName(slug.value || name.value) || 'my-workflow'}".`;
+          slug.focus();
+          return;
+        }
         const created = await request('/targets', {
           method: 'POST',
           body: JSON.stringify({
-            name: name.value,
+            name: name.value.trim(),
             slug: slug.value,
             provider: provider.value,
           }),
