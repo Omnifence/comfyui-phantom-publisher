@@ -101,7 +101,8 @@ def _load_publisher():
     server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
     sys.modules["server"] = server
     execution = types.ModuleType("execution")
-    async def validate_prompt(prompt_id, prompt):
+    async def validate_prompt(prompt_id, prompt, partial_execution_list):
+        assert partial_execution_list is None
         return (True, None, list(prompt), {})
     execution.validate_prompt = validate_prompt
     sys.modules["execution"] = execution
@@ -3320,6 +3321,32 @@ def _stub_runtime_archive(test):
 
 
 class ComfyPromptPreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_validator_receives_none_to_validate_all_outputs(self):
+        workflow = {"1": {"class_type": "SaveImage"}, "2": {"class_type": "SaveImage"}}
+        seen = []
+
+        async def validate_prompt(prompt_id, prompt, partial_execution_list):
+            seen.append((prompt_id, prompt, partial_execution_list))
+            return True, None, list(prompt), {}
+
+        with patch.object(sys.modules["execution"], "validate_prompt", validate_prompt):
+            await publisher._validate_source_workflow(workflow)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0][0])
+        self.assertIs(seen[0][1], workflow)
+        self.assertIsNone(seen[0][2])
+
+    async def test_synchronous_validator_with_partial_execution_argument(self):
+        seen = []
+
+        def validate_prompt(prompt, partial_execution_list):
+            seen.append(partial_execution_list)
+            return True, None, ["1"], {}
+
+        with patch.object(sys.modules["execution"], "validate_prompt", validate_prompt):
+            await publisher._validate_source_workflow({})
+        self.assertEqual(seen, [None])
+
     async def test_uses_comfy_validator_without_queuing_a_prompt(self):
         seen = []
         async def validate_prompt(prompt_id, prompt):
@@ -3332,7 +3359,8 @@ class ComfyPromptPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0][1]["1"]["class_type"], "SaveImage")
 
     async def test_node_errors_are_not_hidden_by_another_valid_output(self):
-        async def validate_prompt(prompt_id, prompt):
+        async def validate_prompt(prompt_id, prompt, partial_execution_list):
+            self.assertIsNone(partial_execution_list)
             return True, None, ["1"], {"2": {"errors": ["missing model"]}}
         with patch.object(sys.modules["execution"], "validate_prompt", validate_prompt):
             with self.assertRaisesRegex(RuntimeError, "missing model"):
