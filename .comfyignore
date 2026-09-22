@@ -1,4 +1,5 @@
 test_publisher.py
+test_runtime_capture.py
 __pycache__/
 .github/
 CLAUDE.md

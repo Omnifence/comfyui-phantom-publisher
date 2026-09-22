@@ -78,11 +78,20 @@ workflow fills it in.
 - For each package, the paths of its compiled Python extensions (`.so`,
   `.pyd`, `.dylib`).
 
-Python dependency locks also capture install sources: Git dependencies keep their exact
-commit and archive installs keep their URL. Local checkouts are archived and uploaded
-automatically (up to 200 MB each, excluding build outputs, caches and virtual
-environments), then installed non-editably in the image. Index installs keep their
-exact version pins. This reproduces code whose version number alone is ambiguous.
+Publisher 0.14 also uploads a content-addressed runtime archive: installed Python
+distribution files, tracked ComfyUI core files (including local modifications),
+resolved native-library dependencies, libraries loaded in the ComfyUI process,
+and native FFmpeg/ffprobe executables when present. Modern editable installs retain
+their source files at their original paths (up to 200 MB per checkout). The image
+restores these bytes instead of resolving wheels or rebuilding Python packages.
+Every archived file is hashed; node imports and handler setup must not change the
+captured package files. Console-script interpreter paths are explicitly relocated.
+
+This capture currently supports standard CPython on Linux x86_64 with Ubuntu
+22.04 or 24.04. It records the exact Python patch version and preserves the source
+OS release. Drivers, libc/the loader, models, caches and environment variables are
+not copied as a machine backup. Model weights use Phantom's existing model-volume
+pipeline. Keep secrets and model data outside source checkouts.
 
 A distribution another distribution has buried is left out of the lock. Two
 wheels can unpack into one package directory (`onnxruntime` and
@@ -92,17 +101,26 @@ Only files inside site-packages count: two unrelated distributions that ship a
 console script of the same name both stay. The lock names the buried ones under
 `shadowed` so the review page can say why they are absent.
 
-Before anything uploads, the publisher checks each package's compiled
-extensions (`.so`, `.pyd`, `.dylib`). Phantom builds the workflow's image for
-whichever Python those binaries need, so a package built for a newer Python
-than the image's default is fine. Every graph of a workflow shares that one
-image, so what stops a publish is a disagreement: a binary in this graph built
-for Python 3.13 while a package in the workflow's primary graph, or in another
-variation, is built for Python 3.12. The message names both packages, both
-files and both versions. Publish both graphs from the same ComfyUI, install
-matching builds of the packages, or split them into separate workflows in
-Phantom. A binary built for macOS or Windows, or for a Python that PyTorch
-ships no wheels for, is refused the same way.
+Before upload, ComfyUI's own prompt validator checks the graph without queuing it.
+Compiled extensions are checked against **this graph's** authoring interpreter;
+Primary and variation graphs have separate images and endpoints. Missing CUDA
+libraries, conflicting cuDNN binaries, missing installed files and unsupported
+source layouts produce an actionable publish error, not a speculative package
+upgrade or downgrade.
+
+Release the updated Phantom API and build worker **before** installing Publisher
+0.14. A capability check prevents a new publisher sending runtime bytes to an old
+server that would ignore them. Existing captures remain buildable via the older
+lock-replay path; republish to obtain runtime archives. A failed v16 capture cannot
+recover system-library bytes it never recorded simply by retrying its old build.
+
+The endpoint uses the pushed image digest, and its CUDA scheduling floor includes
+the captured non-Torch runtime libraries. Build-time checks still validate CUDA
+linkage and node registration. Every graph must pass the existing RunPod execution
+validation before **Make live**. Static capture cannot prove arbitrary subprocess,
+network, JIT or input-dependent behavior: execute representative cases on the final
+GPU image. A source that only appeared to work through CPU fallback is not proof
+that its GPU provider works.
 
 Uploads are content addressed. Phantom asks for a dependency by digest and the
 publisher uploads it only when Phantom does not hold it already, so a second
