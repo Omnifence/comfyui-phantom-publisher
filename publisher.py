@@ -33,7 +33,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.14.0"
+PUBLISHER_VERSION = "0.14.1"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -2147,6 +2147,10 @@ async def _validate_source_workflow(workflow):
     args = {"prompt": workflow}
     if "prompt_id" in parameters:
         args["prompt_id"] = str(uuid.uuid4())
+    if "partial_execution_list" in parameters:
+        # ComfyUI requires this argument on newer versions. None validates all
+        # output nodes; [] would select no outputs and reject a valid workflow.
+        args["partial_execution_list"] = None
     if inspect.iscoroutinefunction(validate):
         result = await validate(**args)
     else:
