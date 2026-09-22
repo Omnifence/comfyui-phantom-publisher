@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import py_compile
 import sys
 import tarfile
 import tempfile
@@ -156,6 +158,305 @@ class RuntimeCaptureTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "Conflicting cuDNN libraries"):
             self.capture()
+
+    def test_driver_families_and_symlink_aliases_are_not_captured(self):
+        names = (
+            "libcuda.so.1",
+            "libcudadebugger.so.1",
+            "libnvoptix.so.1",
+            "libGLX_nvidia.so.0",
+            "libEGL_nvidia.so.0",
+            "libGLESv1_CM_nvidia.so.1",
+            "libGLESv2_nvidia.so.2",
+            "libglxserver_nvidia.so.1",
+            "libvdpau_nvidia.so.1",
+            "libnvidia-ml.so.1",
+            "libnvcuvid.so.1",
+            "nvidia_drv.so",
+        )
+        external = self.root / "driver"
+        external.mkdir()
+        for name in names:
+            (self.site / name).write_bytes(b"\x7fELFdriver")
+            self.dist.files.append(name)
+            (external / name).write_bytes(b"\x7fELFdriver")
+        alias = self.site / "alias.so"
+        alias.symlink_to(external / "libnvoptix.so.1")
+        self.dist.files.append(alias.name)
+        self.ldd_output = "\n".join(
+            f"{name} => {external / name} (0x1)" for name in names
+        )
+        self.ldd_output += f"\nother.so => {alias} (0x1)"
+        for name in ("libcudart.so.13", "libGLdispatch.so.0", "libOpenCL.so.1"):
+            (external / name).write_bytes(b"\x7fELFruntime")
+            self.ldd_output += f"\n{name} => {external / name} (0x1)"
+        result = self.capture()
+        with tarfile.open(result["_archive_path"]) as tar:
+            archived = {Path(name).name for name in tar.getnames()}
+            self.assertFalse(archived.intersection(names))
+            self.assertNotIn("alias.so", archived)
+            self.assertTrue(
+                {"libcudart.so.13", "libGLdispatch.so.0", "libOpenCL.so.1"} <= archived
+            )
+
+    def test_process_maps_and_editable_sources_do_not_transplant_driver_files(self):
+        project = self.root / "project"
+        project.mkdir()
+        source = project / "libGLX_nvidia.so.0"
+        source.write_bytes(b"\x7fELFdriver")
+        original_read = Path.read_text
+
+        def read(path, *args, **kwargs):
+            if str(path) == "/proc/self/maps":
+                return f"0-1 r-xp 0 00:00 1 {source}\n"
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read):
+            result = self.capture(editable_sources={"project": (project, [source])})
+        with tarfile.open(result["_archive_path"]) as tar:
+            self.assertFalse(any("libGLX_nvidia" in name for name in tar.getnames()))
+        self.assertNotIn(str(project), result["native_dirs"])
+
+    def test_sourceless_recorded_bytecode_remains_importable(self):
+        source = self.site / "only_bytecode.py"
+        source.write_text("value = 73\n")
+        compiled = self.site / "only_bytecode.pyc"
+        py_compile.compile(str(source), cfile=str(compiled), doraise=True)
+        source.unlink()
+        self.dist.files.append(compiled.name)
+        result = self.capture()
+        restored = self.root / "restored.pyc"
+        with tarfile.open(result["_archive_path"]) as tar:
+            restored.write_bytes(tar.extractfile("site/only_bytecode.pyc").read())
+        spec = importlib.util.spec_from_file_location("restored", restored)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.value, 73)
+
+    def test_unreadable_unrelated_metadata_does_not_abort_capture(self):
+        class Broken:
+            @property
+            def metadata(self):
+                raise OSError("partial metadata")
+
+        with patch.object(
+            runtime.importlib.metadata,
+            "distributions",
+            return_value=[Broken(), self.dist],
+        ):
+            self.capture()
+        with (
+            patch.object(
+                runtime.importlib.metadata, "distributions", return_value=[Broken()]
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "Distributions disappeared.*onnxruntime-gpu"
+            ),
+        ):
+            self.capture()
+
+    def test_required_package_version_errors_are_not_ignored(self):
+        class BrokenVersion:
+            locate_file = staticmethod(self.dist.locate_file)
+
+            @property
+            def metadata(self):
+                return {"Name": "onnxruntime-gpu"}
+
+            @property
+            def version(self):
+                raise OSError("broken required version")
+
+        with (
+            patch.object(
+                runtime.importlib.metadata,
+                "distributions",
+                return_value=[BrokenVersion()],
+            ),
+            self.assertRaisesRegex(OSError, "broken required version"),
+        ):
+            self.capture()
+
+    def test_active_user_site_and_recorded_user_script_are_preserved(self):
+        user_prefix = self.root / "user"
+        user_site = user_prefix / "lib/python3.12/site-packages"
+        user_site.mkdir(parents=True)
+        script = user_prefix / "bin/onnx-command"
+        script.parent.mkdir()
+        script.write_text("#!/original/bin/python\n")
+        (user_site / "user_package.py").write_text("value = 1\n")
+        self.dist.files = ["user_package.py", "../../../bin/onnx-command"]
+        self.dist.locate_file = lambda name: user_site / name
+        with (
+            patch.object(sys, "path", [str(user_site)]),
+            patch.object(
+                runtime.site, "getusersitepackages", return_value=str(user_site)
+            ),
+            patch.object(runtime.site, "getuserbase", return_value=str(user_prefix)),
+            patch.object(runtime.site, "ENABLE_USER_SITE", True),
+        ):
+            result = self.capture()
+        with tarfile.open(result["_archive_path"]) as tar:
+            self.assertIn("site/user_package.py", tar.getnames())
+            self.assertIn("prefix/bin/onnx-command", tar.getnames())
+
+    def test_import_visible_target_installation_is_captured(self):
+        target = self.root / "custom-target"
+        target.mkdir()
+        (target / "custom.py").write_text("value = 1\n")
+        self.dist.files = ["custom.py"]
+        self.dist.locate_file = lambda name: target / name
+        with patch.object(sys, "path", [str(target)]):
+            result = self.capture()
+        with tarfile.open(result["_archive_path"]) as tar:
+            self.assertIn("site/custom.py", tar.getnames())
+
+    def test_distinct_site_roots_cannot_silently_merge_regular_packages(self):
+        other = self.root / "other-site"
+        other.mkdir()
+        for root, module in ((self.site, "first.py"), (other, "second.py")):
+            (root / "shared").mkdir()
+            (root / "shared/__init__.py").write_text("")
+            (root / "shared" / module).write_text("value = 1\n")
+        self.dist.files = ["shared/first.py"]
+        second = types.SimpleNamespace(
+            metadata={"Name": "second"},
+            version="1",
+            files=["shared/second.py"],
+            locate_file=lambda name: other / name,
+            read_text=lambda name: None,
+        )
+        with (
+            patch.object(sys, "path", [str(self.site), str(other)]),
+            patch.object(
+                runtime.importlib.metadata,
+                "distributions",
+                return_value=[self.dist, second],
+            ),
+            self.assertRaisesRegex(RuntimeError, "Import precedence for shared"),
+        ):
+            runtime.capture(
+                {"onnxruntime-gpu": "1.30.0", "second": "1"},
+                [],
+                self.core,
+                lambda: None,
+            )
+
+    def test_recorded_source_backed_caches_are_not_in_the_immutable_inventory(self):
+        source = self.site / "package.py"
+        cache = Path(py_compile.compile(str(source), doraise=True))
+        legacy = source.with_suffix(".pyc")
+        py_compile.compile(str(source), cfile=str(legacy), doraise=True)
+        self.dist.files.extend([str(cache.relative_to(self.site)), legacy.name])
+        legacy.unlink()  # A cleaned generated cache is not a missing implementation.
+        result = self.capture()
+        with tarfile.open(result["_archive_path"]) as tar:
+            self.assertIn("site/package.py", tar.getnames())
+            self.assertFalse(any(name.endswith(".pyc") for name in tar.getnames()))
+
+    def test_namespace_portions_merge_but_data_file_collisions_are_refused(self):
+        other = self.root / "other-site"
+        other.mkdir()
+        for root, module in ((self.site, "first.py"), (other, "second.py")):
+            (root / "namespace").mkdir()
+            (root / "namespace" / module).write_text("value = 1\n")
+        self.dist.files = ["namespace/first.py"]
+        second = types.SimpleNamespace(
+            metadata={"Name": "second"},
+            version="1",
+            files=["namespace/second.py"],
+            locate_file=lambda name: other / name,
+            read_text=lambda name: None,
+        )
+        with (
+            patch.object(sys, "path", [str(self.site), str(other)]),
+            patch.object(
+                runtime.importlib.metadata,
+                "distributions",
+                return_value=[self.dist, second],
+            ),
+        ):
+            result = runtime.capture(
+                {"onnxruntime-gpu": "1.30.0", "second": "1"},
+                [],
+                self.core,
+                lambda: None,
+            )
+            self.addCleanup(runtime.shutil.rmtree, Path(result["_archive_path"]).parent)
+            with tarfile.open(result["_archive_path"]) as tar:
+                self.assertTrue(
+                    {"site/namespace/first.py", "site/namespace/second.py"}
+                    <= set(tar.getnames())
+                )
+            for root, dist in ((self.site, self.dist), (other, second)):
+                (root / "shared.data").write_text("data")
+                dist.files.append("shared.data")
+            with self.assertRaisesRegex(
+                RuntimeError, "Installed files collide after relocation"
+            ):
+                runtime.capture(
+                    {"onnxruntime-gpu": "1.30.0", "second": "1"},
+                    [],
+                    self.core,
+                    lambda: None,
+                )
+
+    def test_editable_source_cannot_escape_project_via_symlink(self):
+        project = self.root / "project"
+        project.mkdir()
+        alias = project / "outside.py"
+        alias.symlink_to(self.site / "package.py")
+        with self.assertRaisesRegex(RuntimeError, "source symlink escapes"):
+            self.capture(editable_sources={"project": (project, [alias])})
+
+    def test_relative_pth_cannot_escape_relocated_site(self):
+        target = self.site.parent / "other-site"
+        target.mkdir()
+        (self.site / "paths.pth").write_text("../other-site\n")
+        self.dist.files.append("paths.pth")
+        with (
+            patch.object(sys, "path", [str(self.site), str(target)]),
+            self.assertRaisesRegex(
+                RuntimeError, "relative Python path.*cannot be relocated"
+            ),
+        ):
+            self.capture()
+
+    def test_relocated_absolute_site_pth_is_refused(self):
+        (self.site / "paths.pth").write_text(str(self.site) + "\n")
+        self.dist.files.append("paths.pth")
+        with self.assertRaisesRegex(
+            RuntimeError, "absolute Python path.*cannot be relocated"
+        ):
+            self.capture()
+
+    def test_standard_container_project_roots_are_allowed_but_system_roots_are_not(
+        self,
+    ):
+        for root in ("/workspace", "/app", "/projects", str(self.root / "project")):
+            runtime.validate_source_root(Path(root))
+        for root in (
+            "/",
+            "/home",
+            "/root",
+            "/opt",
+            "/tmp",
+            "/var",
+            "/etc/project",
+            "/lib64/project",
+            "/usr/project",
+            "/proc/project",
+            "/opt/venv/project",
+            "/phantom/project",
+            "/opt/phantom-tools/project",
+            str(Path.home()),
+            sys.prefix,
+        ):
+            with (
+                self.subTest(root=root),
+                self.assertRaisesRegex(RuntimeError, "must be a project directory"),
+            ):
+                runtime.validate_source_root(Path(root))
 
 
 if __name__ == "__main__":

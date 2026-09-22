@@ -2117,7 +2117,9 @@ def _capture_runtime(environment, packages, cancellation):
         size = 0
         # Editable installs can import compiled outputs and strict-editable
         # link trees from build/. Preserve these; this is not a source rebuild.
-        exclusions = (_PYTHON_SOURCE_EXCLUSIONS - {"build", "dist"}) | {"models", "checkpoints", "input", "output"}
+        # Generic directory names such as models/ often contain Python code.
+        # Preserve them and fail the size bound rather than silently omit code.
+        exclusions = _PYTHON_SOURCE_EXCLUSIONS - {"build", "dist"}
         for entry in _source_files(root, exclusions):
             _stop_if_cancelled(cancellation)
             if not entry.is_file():

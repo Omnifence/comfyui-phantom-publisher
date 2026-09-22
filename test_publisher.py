@@ -3841,6 +3841,26 @@ class InstallSourceTests(unittest.TestCase):
 
 
 class PythonSourceArchiveTests(unittest.TestCase):
+    def test_runtime_preserves_code_in_model_named_directories_and_keeps_size_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = ["models/model.py", "pkg/models/nested.py", "checkpoints/code.py", "input/reader.py", "output/writer.py", "build/native.so", "dist/generated.py"]
+            for name in paths:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("source bytes")
+            lock = {
+                "distributions": {"editable": "1"},
+                "sources": {"editable": {"kind": "dir", "editable": True, "_local_path": str(root)}},
+            }
+            with patch("runtime_capture.capture", return_value={}) as capture:
+                publisher._capture_runtime(lock, [], None)
+                entries = capture.call_args.args[4]["editable"][1]
+                self.assertEqual({entry.relative_to(root).as_posix() for entry in entries}, set(paths))
+                with patch.object(publisher, "_PYTHON_SOURCE_MAX_BYTES", 1):
+                    with self.assertRaisesRegex(RuntimeError, "exceeds 200 MB"):
+                        publisher._capture_runtime(lock, [], None)
+
     def test_reproducibility_exclusions_progress_and_missing_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "lib"
