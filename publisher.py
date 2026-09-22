@@ -33,7 +33,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-PUBLISHER_VERSION = "0.13.1"
+PUBLISHER_VERSION = "0.14.0"
 # How long a cancel waits for Phantom to abandon one upload before moving on.
 _ABANDON_TIMEOUT_SECONDS = 10
 CONFIG_FILENAME = ".phantom-publisher.json"
@@ -2002,6 +2002,7 @@ def _dependency_progress(
     models: list[dict[str, Any]],
     packages: list[dict[str, Any]],
     python_sources: list[dict[str, Any]] | tuple = (),
+    runtime_artifact: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, Path, int, dict[str, Any]]]]:
     dependencies: list[dict[str, Any]] = []
     uploads: list[tuple[str, Path, int, dict[str, Any]]] = []
@@ -2084,7 +2085,76 @@ def _dependency_progress(
         }
         dependencies.append(item)
         uploads.append((source["archive_sha256"], Path(source["_archive_path"]), size, item))
+    if runtime_artifact:
+        artifact = runtime_artifact
+        item = {
+            "id": "phantom-runtime", "kind": "python_source",
+            "name": "Captured ComfyUI runtime",
+            "detail": "Exact installed Python packages, core and native libraries",
+            "byte_size": artifact["byte_size"], "uploaded_bytes": 0, "progress": 0,
+            "status": "pending", "upload_required": True,
+            "sha256": artifact["archive_sha256"],
+        }
+        dependencies.append(item)
+        uploads.append((artifact["archive_sha256"], Path(artifact["_archive_path"]), artifact["byte_size"], item))
     return dependencies, uploads
+
+
+def _capture_runtime(environment, packages, cancellation):
+    # Relative import in ComfyUI; standalone import in the publisher test harness.
+    if __package__:
+        from .runtime_capture import capture
+    else:
+        from runtime_capture import capture
+    editable_sources = {}
+    for name, source in environment.get("sources", {}).items():
+        if source.get("kind") != "dir" or not source.get("editable"):
+            continue
+        root = Path(source.get("_local_path") or "")
+        if not root.is_dir() or not source.get("_local_path"):
+            raise RuntimeError(f"Editable source for {name} is missing; repair its installation before publishing")
+        entries = []
+        size = 0
+        # Editable installs can import compiled outputs and strict-editable
+        # link trees from build/. Preserve these; this is not a source rebuild.
+        # Generic directory names such as models/ often contain Python code.
+        # Preserve them and fail the size bound rather than silently omit code.
+        exclusions = _PYTHON_SOURCE_EXCLUSIONS - {"build", "dist"}
+        for entry in _source_files(root, exclusions):
+            _stop_if_cancelled(cancellation)
+            if not entry.is_file():
+                continue
+            size += entry.stat().st_size
+            if size > _PYTHON_SOURCE_MAX_BYTES:
+                raise RuntimeError(f"Editable source for {name} exceeds 200 MB; move models/data outside the checkout before publishing")
+            entries.append(entry)
+        editable_sources[name] = (root, entries)
+    return capture(
+        environment["distributions"],
+        [Path(p["_package_directory"]) for p in packages if p.get("_package_directory")],
+        _comfy_source_root(),
+        lambda: _stop_if_cancelled(cancellation),
+        editable_sources,
+    )
+
+
+async def _validate_source_workflow(workflow):
+    """Use ComfyUI's own prompt validation, without queuing or executing it."""
+    import execution
+    import inspect
+    validate = execution.validate_prompt
+    parameters = inspect.signature(validate).parameters
+    args = {"prompt": workflow}
+    if "prompt_id" in parameters:
+        args["prompt_id"] = str(uuid.uuid4())
+    if inspect.iscoroutinefunction(validate):
+        result = await validate(**args)
+    else:
+        result = await asyncio.to_thread(validate, **args)
+    if not isinstance(result, (tuple, list)) or len(result) < 4:
+        raise RuntimeError("This ComfyUI version returned an unsupported prompt validation result")
+    if not result[0] or result[3]:
+        raise RuntimeError(f"ComfyUI source workflow validation failed: {result[1]}; node errors: {result[3]}")
 
 
 def _part_bytes(part_number: int, part_size: int, total_size: int) -> int:
@@ -2356,6 +2426,7 @@ async def _run_publish(
         )
         api_workflow = body["api_workflow"]
         ui_workflow = body["ui_workflow"]
+        await _validate_source_workflow(api_workflow)
         models = await discover(_discover_models, api_workflow, ui_workflow)
         packages = await discover(
             _discover_packages,
@@ -2394,6 +2465,8 @@ async def _run_publish(
         )
         runtime = await discover(_runtime)
         target_runtime = await _target_runtime(body["workflow_id"], config)
+        if not target_runtime or target_runtime.get("runtime_artifact_schema") != 1:
+            raise RuntimeError("Update the Phantom API and build worker before using Publisher 0.14: the server must support verified runtime archives")
         if target_runtime:
             _job_step(
                 job,
@@ -2410,10 +2483,12 @@ async def _run_publish(
             # disagree with the workflow's other graphs, a Python torch has
             # no wheels for, or a binary for another operating system. Only
             # the author can resolve those.
-            problems = _foreign_platform_problems(packages, target_runtime)
-            problem = _image_python_problem(packages, target_runtime)
-            if problem:
-                problems.append(problem)
+            problems = _foreign_platform_problems(packages, {"system": "Linux", "machine": "x86_64"})
+            local_minor = ".".join(runtime["python"].split(".")[:2])
+            for package in packages:
+                constraint = _package_python_constraint(package)
+                if constraint and local_minor not in constraint["pythons"]:
+                    problems.append(f"{constraint['package']} has no binary for this ComfyUI's Python {local_minor}; install a matching package build before publishing")
             if problems:
                 raise RuntimeError(" ".join(problems))
             local_minor = ".".join(runtime["python"].split(".")[:2])
@@ -2421,34 +2496,17 @@ async def _run_publish(
             if target_python and local_minor != target_python:
                 _job_log(
                     job,
-                    f"This ComfyUI runs Python {runtime['python']}; Phantom's image starts "
-                    f"from Python {target_python} and installs the Python a package's "
-                    "compiled extensions need. Every compiled extension in this publish "
-                    "was checked against the workflow's other graphs.",
+                    f"This graph will use its own Python {runtime['python']} runtime, independent of the other graph endpoints.",
                 )
         environment = await discover(_environment_lock)
-        python_sources = await discover(
-            _archive_python_sources, environment, archives=_python_source_archives
+        _job_step(job, "Capturing installed runtime files and native libraries…", status="discovering", progress=25)
+        runtime_artifact = await discover(
+            _capture_runtime, environment, packages,
+            archives=lambda item: [Path(item["_archive_path"])],
         )
-        checkouts = {item["distribution"]: item for item in python_sources}
-        for name, source in environment.get("sources", {}).items():
-            if source["kind"] == "vcs":
-                _job_log(
-                    job,
-                    f"{name} installed from git ({source['url']} @ {source['commit_id'][:12]}); Phantom will install that commit",
-                )
-            elif source["kind"] == "dir":
-                item = checkouts[name]
-                _job_log(
-                    job,
-                    f"{name} installed from a local checkout at {item['path']}; uploading it ({item['byte_size'] / 1024 / 1024:.1f} MB)",
-                )
-            else:
-                _job_log(
-                    job,
-                    f"{name} installed from archive {source['url']}; Phantom will install that source",
-                )
-        dependencies, uploads = _dependency_progress(models, packages, python_sources)
+        # Installed bytes supersede source rebuilds, including VCS and local wheels.
+        environment["sources"] = {}
+        dependencies, uploads = _dependency_progress(models, packages, runtime_artifact=runtime_artifact)
         total_upload_bytes = sum(size for _, _, size, _ in uploads)
         job.update(
             dependencies=dependencies,
@@ -2470,7 +2528,9 @@ async def _run_publish(
                 "publisher_version": PUBLISHER_VERSION,
                 "runtime": runtime,
                 "environment": environment,
+                "runtime_artifact_sha256": runtime_artifact["archive_sha256"],
             },
+            "runtime_artifacts": [{key: value for key, value in runtime_artifact.items() if not key.startswith("_")}],
             "workflow": {"api": api_workflow, "ui": ui_workflow},
             "node_packages": [
                 {key: value for key, value in item.items() if not key.startswith("_")}

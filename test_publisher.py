@@ -100,6 +100,11 @@ def _load_publisher():
     server = types.ModuleType("server")
     server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
     sys.modules["server"] = server
+    execution = types.ModuleType("execution")
+    async def validate_prompt(prompt_id, prompt):
+        return (True, None, list(prompt), {})
+    execution.validate_prompt = validate_prompt
+    sys.modules["execution"] = execution
 
     path = Path(__file__).with_name("publisher.py")
     spec = importlib.util.spec_from_file_location("phantom_publisher_under_test", path)
@@ -3297,6 +3302,49 @@ class CompiledExtensionTests(unittest.TestCase):
         )
 
 
+def _stub_runtime_archive(test):
+    runtime = patch.object(publisher, "_runtime", return_value={"python": "3.13.15", "python_tag": "cp313", "system": "Linux", "machine": "x86_64"})
+    runtime.start()
+    test.addCleanup(runtime.stop)
+    temporary = tempfile.TemporaryDirectory()
+    test.addCleanup(temporary.cleanup)
+    archive = Path(temporary.name) / "runtime.tar.gz"
+    archive.write_bytes(b"fixture")
+    descriptor = {"schema_version": 1, "archive_sha256": "e" * 64, "byte_size": 7, "_archive_path": str(archive)}
+    capture = patch.object(publisher, "_capture_runtime", return_value=descriptor)
+    capture.start()
+    test.addCleanup(capture.stop)
+    upload = patch.object(publisher, "_upload", return_value=True)
+    upload.start()
+    test.addCleanup(upload.stop)
+
+
+class ComfyPromptPreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_comfy_validator_without_queuing_a_prompt(self):
+        seen = []
+        async def validate_prompt(prompt_id, prompt):
+            seen.append((prompt_id, prompt))
+            return True, None, ["1"], {}
+        with patch.object(sys.modules["execution"], "validate_prompt", validate_prompt):
+            await publisher._validate_source_workflow({"1": {"class_type": "SaveImage"}})
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0][0])
+        self.assertEqual(seen[0][1]["1"]["class_type"], "SaveImage")
+
+    async def test_node_errors_are_not_hidden_by_another_valid_output(self):
+        async def validate_prompt(prompt_id, prompt):
+            return True, None, ["1"], {"2": {"errors": ["missing model"]}}
+        with patch.object(sys.modules["execution"], "validate_prompt", validate_prompt):
+            with self.assertRaisesRegex(RuntimeError, "missing model"):
+                await publisher._validate_source_workflow({})
+
+    async def test_supports_older_synchronous_validator(self):
+        def validate_prompt(prompt):
+            return True, None, ["1"], {}
+        with patch.object(sys.modules["execution"], "validate_prompt", validate_prompt):
+            await publisher._validate_source_workflow({})
+
+
 class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
@@ -3307,6 +3355,7 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         )
         lock.start()
         self.addCleanup(lock.stop)
+        _stub_runtime_archive(self)
 
     def _job(self, job_id: str) -> dict[str, Any]:
         job = {
@@ -3333,11 +3382,20 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         publisher._discover_models = lambda *_args: []
         publisher._discover_packages = lambda *_args: packages
         publisher._discover_huggingface_models = lambda *_args: []
-        publisher._phantom_request = request
+        async def supported_request(method, path, config, *args, **kwargs):
+            result = await request(method, path, config, *args, **kwargs)
+            if path == "/targets":
+                if not result.get("targets"):
+                    result = {"targets": [{"workflow_id": "wf-1", "runtime": {}}]}
+                for target in result["targets"]:
+                    if "runtime" in target:
+                        target["runtime"]["runtime_artifact_schema"] = 1
+            return result
+        publisher._phantom_request = supported_request
         for name, value in originals.items():
             self.addCleanup(setattr, publisher, name, value)
 
-    async def test_refuses_before_staging_when_the_graphs_would_disagree(self):
+    async def test_refuses_before_staging_when_own_binary_disagrees_with_source_python(self):
         job = self._job("job-runtime-refused")
         calls: list[str] = []
 
@@ -3377,7 +3435,7 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
                     "class_types": ["dw_reactor"],
                     "archive_sha256": "c" * 64,
                     "compiled_extensions": [
-                        "DiffusionWave_reactor/_dw_core.cpython-313-x86_64-linux-gnu.so"
+                        "DiffusionWave_reactor/_dw_core.cpython-312-x86_64-linux-gnu.so"
                     ],
                 }
             ],
@@ -3385,9 +3443,8 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         )
         await publisher._run_publish("job-runtime-refused", _PUBLISH_BODY)
         self.assertEqual(job["status"], "failed")
-        self.assertIn('Package "DiffusionWave_PickResolution" in the primary graph is built for Python 3.12', job["error"])
-        self.assertIn('package "DiffusionWave_reactor" in this graph is built for Python 3.13', job["error"])
-        self.assertIn("Publish both graphs from the same ComfyUI", job["error"])
+        self.assertIn("DiffusionWave_reactor has no binary for this ComfyUI's Python 3.13", job["error"])
+        self.assertNotIn("DiffusionWave_PickResolution", job["error"])
         # Nothing staged, nothing uploaded: the only call was the runtime lookup.
         self.assertEqual(calls, ["GET /targets"])
 
@@ -3429,13 +3486,13 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
         await publisher._run_publish("job-runtime-ok", _PUBLISH_BODY)
         self.assertEqual(job["status"], "completed", job.get("error"))
         manifest = bodies[0]["manifest"]
-        self.assertEqual(manifest["comfyui"]["runtime"]["python_tag"], f"cp{sys.version_info[0]}{sys.version_info[1]}")
+        self.assertEqual(manifest["comfyui"]["runtime"]["python_tag"], "cp313")
         self.assertEqual(
             manifest["node_packages"][0]["compiled_extensions"],
             ["pack/_core.cpython-313-x86_64-linux-gnu.so"],
         )
 
-    async def test_checkout_manifest_upload_and_cleanup(self):
+    async def test_runtime_manifest_upload_and_cleanup(self):
         job = self._job("job-python-checkout")
         manifests, uploaded = [], []
 
@@ -3465,14 +3522,16 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await publisher._run_publish("job-python-checkout", _PUBLISH_BODY)
         self.assertEqual(job["status"], "completed", job.get("error"))
-        source = manifests[0]["comfyui"]["environment"]["sources"]["sam3"]
+        source = manifests[0]["runtime_artifacts"][0]
         self.assertEqual(len(source["archive_sha256"]), 64)
-        self.assertNotIn("_local_path", source)
+        self.assertNotIn("_archive_path", source)
+        self.assertEqual(manifests[0]["comfyui"]["runtime_artifact_sha256"], source["archive_sha256"])
+        self.assertEqual(manifests[0]["comfyui"]["environment"]["sources"], {})
         self.assertEqual(job["dependencies"][0]["status"], "reused")
         self.assertEqual(len(uploaded), 1)
         self.assertFalse(uploaded[0].exists())
 
-    async def test_an_older_phantom_without_a_runtime_still_publishes(self):
+    async def test_an_older_phantom_cannot_silently_drop_runtime_artifacts(self):
         job = self._job("job-runtime-unknown")
 
         async def fake_request(_method, path, _config, *_args, **_kwargs):
@@ -3492,7 +3551,8 @@ class PublishRuntimeCheckTests(unittest.IsolatedAsyncioTestCase):
             fake_request,
         )
         await publisher._run_publish("job-runtime-unknown", _PUBLISH_BODY)
-        self.assertEqual(job["status"], "completed", job.get("error"))
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("Update the Phantom API", job["error"])
 
     async def test_the_environment_lock_is_taken_in_a_discovery_worker(self):
         # The shadow check hashes native libraries; done on the event loop it
@@ -3552,6 +3612,10 @@ class StagedVariationTests(unittest.IsolatedAsyncioTestCase):
         )
         lock.start()
         self.addCleanup(lock.stop)
+        _stub_runtime_archive(self)
+        target = patch.object(publisher, "_target_runtime", return_value={"runtime_artifact_schema": 1})
+        target.start()
+        self.addCleanup(target.stop)
 
     """
     A new variation learns its id from the publish that created it. The panel
@@ -3777,6 +3841,26 @@ class InstallSourceTests(unittest.TestCase):
 
 
 class PythonSourceArchiveTests(unittest.TestCase):
+    def test_runtime_preserves_code_in_model_named_directories_and_keeps_size_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = ["models/model.py", "pkg/models/nested.py", "checkpoints/code.py", "input/reader.py", "output/writer.py", "build/native.so", "dist/generated.py"]
+            for name in paths:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("source bytes")
+            lock = {
+                "distributions": {"editable": "1"},
+                "sources": {"editable": {"kind": "dir", "editable": True, "_local_path": str(root)}},
+            }
+            with patch("runtime_capture.capture", return_value={}) as capture:
+                publisher._capture_runtime(lock, [], None)
+                entries = capture.call_args.args[4]["editable"][1]
+                self.assertEqual({entry.relative_to(root).as_posix() for entry in entries}, set(paths))
+                with patch.object(publisher, "_PYTHON_SOURCE_MAX_BYTES", 1):
+                    with self.assertRaisesRegex(RuntimeError, "exceeds 200 MB"):
+                        publisher._capture_runtime(lock, [], None)
+
     def test_reproducibility_exclusions_progress_and_missing_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "lib"

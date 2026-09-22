@@ -23,7 +23,7 @@ jobs:
       # The tests stub folder_paths, server and aiohttp, so ComfyUI itself is
       # not a test dependency.
       - name: Run tests
-        run: python -m unittest test_publisher -v
+        run: python -m unittest discover -v
 
   test-web:
     runs-on: ubuntu-latest
