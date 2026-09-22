@@ -159,6 +159,43 @@ class RuntimeCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Conflicting cuDNN libraries"):
             self.capture()
 
+    def test_private_cudnn_and_platform_cudnn_are_preserved_separately(self):
+        names = ("nvvfx/libs/libcudnn.so.9", "nvidia/cudnn/lib/libcudnn.so.9")
+        for name in names:
+            path = self.site / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\x7fELF" + name.encode())
+            self.dist.files.append(name)
+        # Match Torch's non-canonical path from the reported failure.
+        (self.site / "torch/lib").mkdir(parents=True)
+        torch_path = self.site / "torch/lib/../../nvidia/cudnn/lib/libcudnn.so.9"
+        self.ldd_output = (
+            f"libcudnn.so.9 => {self.site / names[0]} (0x1)\n"
+            f"libcudnn.so.9 => {torch_path} (0x2)\n"
+        )
+        result = self.capture()
+        self.assertEqual(result["native_dirs"], [])
+        with tarfile.open(result["_archive_path"]) as tar:
+            for name in names:
+                self.assertEqual(
+                    tar.extractfile("site/" + name).read(),
+                    (self.site / name).read_bytes(),
+                )
+            self.assertFalse(any(name.startswith("native/") for name in tar.getnames()))
+
+    def test_external_cudnn_cannot_conflict_with_globally_registered_wheel(self):
+        wheel = self.site / "nvidia/cudnn/lib/libcudnn.so.9"
+        external = self.root / "cuda/libcudnn.so.9"
+        for path in (wheel, external):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\x7fELF" + str(path).encode())
+        self.dist.files.append(wheel.relative_to(self.site).as_posix())
+        self.ldd_output = (
+            f"libcudnn.so.9 => {wheel} (0x1)\nlibcudnn.so.9 => {external} (0x2)\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "Conflicting cuDNN libraries"):
+            self.capture()
+
     def test_driver_families_and_symlink_aliases_are_not_captured(self):
         names = (
             "libcuda.so.1",

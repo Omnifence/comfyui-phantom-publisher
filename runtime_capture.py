@@ -424,6 +424,16 @@ def capture(
         for name in distributions
         if (match := re.search(r"-cu(\d+)$", name)) and name.startswith("nvidia-")
     }
+    resolved_sites = {p.resolve() for p in sites}
+    # Mirror the builder's nvidia/*/lib registration. Other wheel-local library
+    # folders remain private: preserve their bytes and relative loading paths,
+    # but never turn them into competing entries in the global loader cache.
+    global_wheel_dirs = {
+        directory.resolve()
+        for root in resolved_sites
+        for directory in root.glob("nvidia/*/lib")
+        if directory.is_dir()
+    }
     cudnn_copies = {}
     for path in libraries.values():
         check_cancelled()
@@ -432,18 +442,21 @@ def capture(
         match = CUDA_RUNTIME.match(path.name)
         if match:
             cuda_majors.add(int(match[1]))
-        # CUDA generations of cuDNN can share a SONAME; copying both and
-        # sorting their directories is not a safe compatibility policy.
+        resolved = path.resolve()
+        in_site = any(resolved.is_relative_to(p) for p in resolved_sites)
+        if in_site and resolved.parent not in global_wheel_dirs:
+            continue
+        # Only globally registered copies compete here. Package-private copies
+        # (e.g. nvvfx/libs versus nvidia/cudnn/lib) can differ without proving a
+        # conflict, and have already been captured at separate RECORD paths.
         if path.name.startswith("libcudnn"):
             sha = digest(path)
             prior = cudnn_copies.setdefault(path.name, (sha, path))
             if prior[0] != sha:
                 raise RuntimeError(
-                    f"Conflicting cuDNN libraries share {path.name}: {prior[1]} and {path}; use one compatible cuDNN stack before publishing"
+                    f"Conflicting cuDNN libraries share {path.name} in global library directories: {prior[1]} and {path}; use one compatible global cuDNN stack before publishing"
                 )
-        if BASE_ABI.match(path.name) or any(
-            path.resolve().is_relative_to(p) for p in sites
-        ):
+        if BASE_ABI.match(path.name) or in_site:
             continue
         # Reproduce absolute paths: RPATH and relative dlopen targets keep working.
         add_file("native/" + path.as_posix().lstrip("/"), path)

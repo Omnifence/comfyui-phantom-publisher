@@ -104,9 +104,13 @@ console script of the same name both stay. The lock names the buried ones under
 Before upload, ComfyUI's own prompt validator checks the graph without queuing it.
 Compiled extensions are checked against **this graph's** authoring interpreter;
 Primary and variation graphs have separate images and endpoints. Missing CUDA
-libraries, conflicting cuDNN binaries, missing installed files and unsupported
-source layouts produce an actionable publish error, not a speculative package
-upgrade or downgrade.
+libraries, conflicting globally registered cuDNN binaries, missing installed files
+and unsupported source layouts produce an actionable publish error, not a
+speculative package upgrade or downgrade.
+Package-private libraries (such as VFX's bundled cuDNN) retain their separate
+package paths; they are not promoted into the global library search path merely
+because another package ships the same filename. GPU workflow validation remains
+required before making a deployment live.
 
 Release the updated Phantom API and build worker **before** installing Publisher
 0.14. A capability check prevents a new publisher sending runtime bytes to an old
